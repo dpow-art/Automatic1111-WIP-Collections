@@ -273,6 +273,10 @@ extensions/A1111-Collections/
 
 ---
 
+Icon Attribution for icons used:
+Stop by Hermanto from <a href="https://thenounproject.com/browse/icons/term/stop/" target="_blank" title="Stop Icons">Noun Project</a> (CC BY 3.0)
+
+
 🤝 Contributing
 
 This project is in active development.
