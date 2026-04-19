@@ -1,3 +1,4 @@
+import base64
 import html
 import json
 from pathlib import Path
@@ -15,6 +16,10 @@ EXTENSION_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = EXTENSION_ROOT / "data"
 DEFAULT_DB_PATH = DATA_DIR / "collections.db"
 DEFAULT_IMAGE_CACHE_DIR = DATA_DIR / "images"
+NSFW_ON_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "nsfw_on.svg"
+NSFW_ON_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    NSFW_ON_ICON_PATH.read_bytes()
+).decode("ascii")
 
 _db: Optional[CollectionDatabase] = None
 _hide_nsfw: bool = False
@@ -39,10 +44,18 @@ def _settings() -> Dict[str, str]:
         or str(DEFAULT_IMAGE_CACHE_DIR)
     )
 
+    nsfw_filter_mode = (
+        getattr(shared.opts, "collection_nsfw_filter_mode", "r_and_above")
+        or "r_and_above"
+    ).strip().lower()
+    if nsfw_filter_mode not in {"r_and_above", "x_and_above"}:
+        nsfw_filter_mode = "r_and_above"
+
     return {
         "api_key": api_key,
         "source_mode": source_mode,
         "image_cache_dir": image_cache_dir,
+        "nsfw_filter_mode": nsfw_filter_mode,
     }
 
 
@@ -274,6 +287,10 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
 
     global _hide_nsfw
     if _hide_nsfw:
+        settings = _settings()
+        nsfw_filter_mode = settings["nsfw_filter_mode"]
+        cutoff = 4 if nsfw_filter_mode == "r_and_above" else 8
+
         filtered_items = []
         for item in items:
             try:
@@ -281,7 +298,7 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
             except Exception:
                 rating_value = 0
 
-            if rating_value < 4:
+            if rating_value < cutoff:
                 filtered_items.append(item)
 
         items = filtered_items
@@ -419,7 +436,7 @@ def _create_local_collection(name: str) -> str:
     return _refresh_sidebar_payload()
 
 
-def _toggle_nsfw_filter(selected_collection_id_raw: str) -> tuple[str, str, str]:
+def _toggle_nsfw_filter(selected_collection_id_raw: str):
     global _hide_nsfw
     _hide_nsfw = not _hide_nsfw
 
@@ -430,7 +447,10 @@ def _toggle_nsfw_filter(selected_collection_id_raw: str) -> tuple[str, str, str]
     except Exception:
         selected_collection_id = None
 
+    button_variant = "secondary" if _hide_nsfw else "primary"
+
     return (
+        gr.update(variant=button_variant),
         _render_controls_bar(),
         _refresh_sidebar_payload(selected_collection_id),
         _render_feed_html(selected_collection_id),
@@ -619,6 +639,22 @@ def on_ui_settings() -> None:
     )
 
     shared.opts.add_option(
+        "collection_nsfw_filter_mode",
+        shared.OptionInfo(
+            "r_and_above",
+            "18+ Button Filter Behavior",
+            gr.Radio,
+            {
+                "choices": [
+                    ("Hide R, X, XXX", "r_and_above"),
+                    ("Hide X, XXX (recommended)", "x_and_above"),
+                ]
+            },
+            section=section,
+        ).info("Controls what the 18+ button hides in the collection view"),
+    )
+
+    shared.opts.add_option(
         "collection_cache_dir",
         shared.OptionInfo(
             str(DEFAULT_IMAGE_CACHE_DIR),
@@ -650,30 +686,75 @@ def on_ui_tabs():
     with gr.Blocks(analytics_enabled=False) as collection_tab:
 
         gr.HTML(
-            """
+            f"""
             <style>
+            /* =========================
+            NSFW BUTTON BASE (SIZE)
+            ========================= */
             #collection_toolbar_nsfw_button,
-            #collection_toolbar_nsfw_button.lg {
+            #collection_toolbar_nsfw_button.lg {{
                 min-width: 28px !important;
                 width: 28px !important;
                 height: 24px !important;
                 min-height: 24px !important;
-                padding: 0 4px !important;
-                font-size: 10px !important;
-                line-height: 1 !important;
-                border-radius: 6px !important;
                 margin-top: 6px !important;
                 margin-left: 4px !important;
-            }
+                padding: 0 !important;
+                position: relative !important;
+                overflow: hidden !important;
+
+                border: none !important;
+                box-shadow: none !important;
+
+                font-size: 0 !important;
+                color: transparent !important;
+            }}
+
+            #collection_toolbar_nsfw_button::before,
+            #collection_toolbar_nsfw_button.lg::before {{
+                content: "" !important;
+                position: absolute !important;
+                inset: 0 !important;
+                background-repeat: no-repeat !important;
+                background-position: center !important;
+                background-size: 20px 20px !important;
+                background-image: url("{NSFW_ON_ICON_DATA_URI}") !important;
+                pointer-events: none !important;
+                z-index: 2 !important;
+            }}
+
+            /* =========================
+               NSFW BUTTON COLORS
+            ========================= */
+
+            /* OFF (not filtering) → ORANGE */
+            #collection_toolbar_nsfw_button.primary,
+            #collection_toolbar_nsfw_button.lg.primary {{
+                background-color: #ff7a1a !important;
+            }}
+
+            /* ON (filter active) → GRAY */
+            #collection_toolbar_nsfw_button.secondary,
+            #collection_toolbar_nsfw_button.lg.secondary {{
+                background-color: #3a4352 !important;
+            }}
+
+            /* =========================
+            OPTIONAL: HOVER STATES
+            ========================= */
+
+            /* Hover when OFF */
+            #collection_toolbar_nsfw_button.primary:hover,
+            #collection_toolbar_nsfw_button.lg.primary:hover {{
+                background-color: #ff8c33 !important;
+            }}
+
+            /* Hover when ON */
+            #collection_toolbar_nsfw_button.secondary:hover,
+            #collection_toolbar_nsfw_button.lg.secondary:hover {{
+                background-color: #4a5160 !important;
+            }}
             </style>
-            <script>
-            setTimeout(() => {
-                const btn = gradioApp().querySelector('#collection_toolbar_nsfw_button');
-                if (btn) {
-                    btn.setAttribute('title', '18+');
-                }
-            }, 0);
-            </script>
             """
         )
 
@@ -721,16 +802,16 @@ def on_ui_tabs():
 
                     with gr.Column(scale=0, min_width=36):
                         nsfw_toggle_button = gr.Button(
-                            "🚫",
+                            value="",
                             elem_id="collection_toolbar_nsfw_button",
                             tooltip="18+",
+                            variant="primary",
                         )
 
                 feed_html = gr.HTML(
                     value=_render_feed_html(None),
                     elem_id="collection_feed_html",
                 )
-
 
         sync_button.click(
             fn=_sync_collections,
@@ -747,8 +828,8 @@ def on_ui_tabs():
         nsfw_toggle_button.click(
             fn=_toggle_nsfw_filter,
             inputs=[selected_collection_id],
-            outputs=[controls_html, sidebar_html, feed_html],
-        )
+            outputs=[nsfw_toggle_button, controls_html, sidebar_html, feed_html],
+       )
 
         clear_cache_button.click(
             fn=_clear_cache,
