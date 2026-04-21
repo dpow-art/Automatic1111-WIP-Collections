@@ -1,0 +1,124 @@
+#collection-root {
+  --collection-bg: #1f2126;
+  --collection-panel: #262931;
+  --collection-border: #3b404c;
+  --collection-text: #f4f5f7;
+  --collection-muted: #a6adbb;
+  --collection-accent: #6d7384;
+}
+
+#collection-root .collection-settings,
+#collection-sidebar,
+#collection-main,
+#collection-detail {
+  background: var(--collection-bg);
+  border: 1px solid var(--collection-border);
+  border-radius: 14px;
+  padding: 12px;
+}
+
+#collection-root .collection-layout {
+  align-items: stretch;
+  margin-top: 12px;
+}
+
+#collection-root .collection-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+#collection-root .collection-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  border: 1px solid var(--collection-border);
+  background: var(--collection-panel);
+  color: var(--collection-text);
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+}
+
+#collection-root .collection-toolbar {
+  gap: 12px;
+  align-items: end;
+}
+
+#collection-root .collection-feed {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  margin-top: 12px;
+}
+
+#collection-root .collection-card {
+  background: var(--collection-panel);
+  border: 1px solid var(--collection-border);
+  border-radius: 16px;
+  overflow: hidden;
+  padding: 0;
+  color: var(--collection-text);
+  cursor: pointer;
+}
+
+#collection-root .collection-card img {
+  width: 100%;
+  display: block;
+  background: #2d3139;
+}
+
+#collection-root .card-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  color: var(--collection-muted);
+  font-size: 0.9rem;
+}
+
+#collection-root .detail-card {
+  background: var(--collection-panel);
+  border: 1px solid var(--collection-border);
+  border-radius: 16px;
+  padding: 16px;
+}
+
+#collection-root .detail-section {
+  margin-top: 14px;
+}
+
+#collection-root .detail-section h3 {
+  margin-bottom: 8px;
+}
+
+#collection-root .detail-header {
+  display: flex;
+  justify-content: space-between;
+  color: var(--collection-muted);
+}
+
+#collection-root .lora-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+#collection-root .status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+#collection-root .status-dot.green { background: #3ddc84; }
+#collection-root .status-dot.yellow { background: #ffcf5a; }
+#collection-root .status-dot.red { background: #ff5f6d; }
+
+#collection-root .detail-empty,
+#collection-root .collection-empty {
+  color: var(--collection-muted);
+  padding: 12px 4px;
+}
