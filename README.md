@@ -1,285 +1,245 @@
-A1111 Collections
+# 📦 Automatic1111 Collections Extension
 
-A1111 Collections is an extension for AUTOMATIC1111 Stable Diffusion WebUI that creates a local, offline-capable library of Civitai images and their full generation data.
+## 🎯 Project Overview
 
-It allows users to browse, organize, and reuse generation setups without needing to constantly return to external websites.
+This extension adds a **local-first Civitai collections browser** directly inside AUTOMATIC1111 Stable Diffusion WebUI.
 
----
+The goal is to create a **fully offline-capable reference system** that allows users to:
 
-✨ Core Idea
-
-«Build a local-first reference library for Stable Diffusion workflows.»
-
-Instead of:
-
-- jumping between browser tabs
-- manually copying prompts
-- losing LoRA setups
-
-You get:
-
-- a clean visual browser
-- complete generation data
-- one-click reuse inside A1111
+- Browse synced Civitai collections
+- View full generation metadata
+- Reconstruct images with correct parameters
+- Track required resources (LoRAs, checkpoints, etc.)
+- Build a personal, local reference library
 
 ---
 
-🚀 Features
+## 🧠 Core Philosophy
 
-🔄 Civitai Sync
-
-- Sync images using API key
-- Supports:
-  - Auto
-  - SFW (".com")
-  - Full (".red")
-- Stores data locally
+- **Local-first** → No dependency on Civitai after sync  
+- **Clean UI** → Pinterest-style browsing, minimal clutter  
+- **Accurate reconstruction** → Preserve generation data exactly  
+- **A1111-native** → Built using official extension hooks and Gradio  
 
 ---
 
-🗂️ Local Library
+## 🏗️ Current Feature Status
 
-- SQLite-backed database
-- Offline browsing
-- Cached image previews
+### ✅ Backend (Stable)
 
----
+#### Image Data Extraction
+- Prompt / Negative Prompt
+- Steps / CFG / Sampler / Seed
+- Resolution (Width / Height)
+- Generator (A1111 / ComfyUI)
 
-🧩 Collections System
+#### Resource Tracking
+- Checkpoints
+- LoRAs (with weights)
+- Embeddings
+- Upscalers
+- Model + Version IDs
 
-- Synced collections (Civitai)
-- Local collections (user-created)
-- Add images to custom collections
-
----
-
-🧠 LoRA Awareness
-
-- Detects LoRAs used in images
-- Status indicators:
-  - 🟢 Installed
-  - 🟡 Possible match
-  - 🔴 Missing
-
----
-
-🎯 Send to txt2img
-
-- Transfers:
-  - prompt
-  - negative prompt
-  - LoRAs with weights
-  - core generation settings
+#### Database
+- `items` table ✅
+- `resources` table ✅
+- `generation_params` table ✅
+- Clean normalized schema
 
 ---
 
-🔞 Content Filtering
+### ✅ Sync System
 
-- Toggle to hide:
-  - R / X / XXX content
-- Works offline
-
----
-
-📊 Sorting
-
-- Custom order
-- Rating (G → XXX)
-- Newest / Oldest
+- Pulls collections from Civitai API
+- Downloads:
+  - Preview images
+  - Full-resolution media
+  - Video / GIF support
+- Stores everything locally
 
 ---
 
-🖼️ Visual Browser (Planned)
+### ✅ Existing UI Components
 
-- Pinterest-style masonry layout
-- Adjustable thumbnail size
-- Smooth scrolling
-
----
-
-🎬 Focus Mode (Planned)
-
-- Click image → expand to center
-- Right panel slides in
-- Clean viewing mode
-- Arrow navigation
+- Collection tab registered in A1111
+- Sidebar with synced collections
+- Feed rendering system
+- NSFW filter system:
+  - Toggle button
+  - Settings-based filtering (R / X / XXX)
+- Custom toolbar button system (SVG + CSS + Gradio state)
 
 ---
 
-📦 Installation
+## 🚧 Current Focus (IN PROGRESS)
 
-Method 1: Git Clone (Recommended)
+### 🟢 UI View System (PRIMARY PHASE)
 
-cd stable-diffusion-webui/extensions
-git clone https://github.com/dpow-art/A1111-Collections.git
-
-Restart A1111.
+We are building a **3-mode browsing system**:
 
 ---
 
-Method 2: Download ZIP
+### 1️⃣ Regular View (Default)
 
-1. Download this repo as ZIP
-2. Extract into:
-
-stable-diffusion-webui/extensions/A1111-Collections
-
-3. Restart A1111
+- Sidebar (collections)
+- Masonry grid (Pinterest-style)
+- Adjustable preview size
+- Scrollable feed
 
 ---
 
-⚙️ Setup
+### 2️⃣ Scrolling View (Immersive)
 
-Go to:
-
-Settings → Collection
-
-Set:
-
-- Civitai API Key
-- Image Cache Directory
-- Source Mode
-
-Click:
-
-- Apply Settings
-- Reload UI
-
----
-
-🧭 Usage
-
-1. Open Collection tab
-2. Click Sync collections
-3. Browse images
-4. Click an image to view details
-5. Use:
-   - Send to txt2img
-   - Add to collections
-   - Copy generation data
-
----
-
-🧱 Project Status
-
-✅ Completed
-
-- Extension scaffold
-- A1111 settings integration
-- API connection (images endpoint)
-- SQLite database system
-- Basic sync flow
-- LoRA parsing foundation
-
----
-
-🚧 In Progress
-
-- Storing synced images in DB
-- Image preview caching
-- Rendering real images in UI
-
----
-
-⏳ Planned
-
-- Masonry image browser
-- Focus mode UI
-- Drag-and-drop ordering
-- Full collection sync
-- Advanced filtering
-- Performance optimization
-
----
-
-🗺️ Roadmap
-
-Phase 1 — Core Sync (Current)
-
-- [x] API connection
-- [x] Settings integration
-- [ ] Store images in DB
-- [ ] Cache preview images
-- [ ] Display images in UI
-
----
-
-Phase 2 — Library System
-
-- [ ] Local collections
-- [ ] Add/remove items
-- [ ] Custom ordering
-
----
-
-Phase 3 — Workflow Tools
-
-- [ ] LoRA matching
-- [ ] Full txt2img transfer
-- [ ] Missing resource warnings
-
----
-
-Phase 4 — UI Upgrade
-
-- [ ] Masonry layout
-- [ ] Thumbnail resizing
-- [ ] Smooth transitions
-
----
-
-Phase 5 — Focus Mode
-
-- [ ] Expand image view
-- [ ] Slide-in detail panel
-- [ ] Arrow navigation
-- [ ] GIF support
-
----
-
-Phase 6 — Polish
-
-- [ ] Cache management tools
-- [ ] Performance improvements
-- [ ] UI refinement
-
----
-
-🧠 Design Philosophy
-
+- Full-width vertical feed
+- No sidebar
 - Minimal UI
-- Visual-first workflow
-- Hide complexity, don’t remove it
-- Offline-first design
-- No friction between inspiration and creation
+- Large image display
 
 ---
 
-📁 Repo Structure
+### 3️⃣ Detailed View (Image Inspector)
 
-extensions/A1111-Collections/
-├── scripts/
-│   └── collection_tab.py
-├── lib/
+- Large image on left
+- Full metadata panel on right:
+  - Creator / links
+  - Prompt / negative prompt
+  - Generation settings
+  - Resources used
+
+**Future:**
+- 🟢 / 🔴 indicators for local resource availability
+
+---
+
+## 🎮 Control System (Top Bar)
+
+### View Switching Buttons
+- Grid → Regular View
+- Scroll → Scrolling View
+- Focus → Detailed View
+
+### Preview Scaling
+- Slider-based control
+- Affects:
+  - Grid density
+  - Image size
+
+---
+
+## 🧱 UI Architecture
+
+```text
+Collection Tab
+├── Top Control Bar
+│   ├── View Buttons
+│   ├── Preview Slider
+│
+├── Main Container
+│   ├── Sidebar
+│   ├── Content Area
+│       ├── Grid View
+│       ├── Scrolling View
+│       ├── Detailed View
+
+🧠 UX Rules (LOCKED)
+Minimalist design (no clutter)
+Consistent controls across views
+Persistent state:
+Scroll position
+Selected image
+No aggressive animations
+
+
+🧪 Development Timeline
+✅ Phase 0 — Foundation (COMPLETE)
+Extension registration
+Settings integration
+Data pipeline
+Database schema
+Media download system
+✅ Phase 1 — Baseline UI (COMPLETE)
+Collection sidebar
+Feed rendering
+NSFW filter system
+Button architecture established
+🔄 Phase 2 — View System Core (CURRENT)
+View switching logic
+Layout containers
+Toolbar system
+State handling between views
+⏳ Phase 3 — View Implementation
+Regular view polish
+Scrolling view build
+Detailed view layout + binding
+⏳ Phase 4 — Navigation
+Left / right image navigation
+State persistence
+⏳ Phase 5 — Resource Matching
+🟢 Available locally
+🔴 Missing resources
+Applies to:
+LoRAs
+Checkpoints
+Embeddings
+Upscalers
+⏳ Phase 6 — Reconstruction Tools
+Copy generation data
+Send to txt2img
+Auto-apply LoRAs
+
+
+🧩 Technical Structure
+collection/
+├── assets/
+│   └── icons/
+├── collection_lib/
 │   ├── civitai_api.py
 │   ├── database.py
-│   ├── lora_matcher.py
-│   └── parser.py
+│
 ├── data/
-│   ├── cache.db
+│   ├── collections.db
 │   └── images/
-├── javascript/
-├── style.css
+│
+├── scripts/
+│   └── collection_tab.py
 
----
+⚙️ Development Rules
+✔ Use Gradio for behavior
+button.click(fn=..., inputs=[...], outputs=[...])
+✔ Use A1111 callbacks
+script_callbacks.on_ui_tabs(...)
+script_callbacks.on_ui_settings(...)
+✔ Use CSS for visuals only
+✔ Use elem_id for styling hooks
+
+🚫 What to Avoid
+DOM click hacks (querySelector().click())
+Inline SVG inside gr.Button(value=...)
+Mixing multiple experimental changes at once
+Incorrect CSS targeting
+Broken f-string CSS braces
+
+🟢 Current Status Summary
+Backend: Complete and stable
+Sync system: Working
+UI: Transitioning to multi-view system
+Buttons: Standardized and ready for expansion
 
 
-🤝 Contributing
+🔜 Next Immediate Task
 
-This project is in active development.
+Build view switching system + layout scaffolding
 
----
+This includes:
 
-📄 License
+Toolbar buttons (grid / scroll / detailed)
+View state management
+Container switching logic
+📌 Final Note
 
-MIT License
+This project is designed to:
+
+Stay aligned with A1111 architecture
+Remain stable and maintainable
+Provide a clean, professional browsing experience
+Enable full offline reconstruction workflows
