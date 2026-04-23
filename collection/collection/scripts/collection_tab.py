@@ -2,6 +2,8 @@ import base64
 import hashlib
 import html
 import json
+import re
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote, urlparse
@@ -28,7 +30,11 @@ NSFW_ON_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
 
 _db: Optional[CollectionDatabase] = None
 _hide_nsfw: bool = False
-_stop_sync: bool = False
+_stop_requested: bool = False
+
+DETAIL_REQUEST_DELAY_SECONDS = 1.25
+DETAIL_REQUEST_FAILURE_BACKOFF_SECONDS = 8.0
+DETAIL_REQUEST_MAX_CONSECUTIVE_FAILURES = 3
 
 
 def _get_db() -> CollectionDatabase:
@@ -45,9 +51,14 @@ def _settings() -> Dict[str, str]:
     if source_mode not in {"full", "sfw"}:
         source_mode = "full"
 
-    image_cache_dir = (
-        (getattr(shared.opts, "collection_cache_dir", "") or "").strip()
-        or str(DEFAULT_IMAGE_CACHE_DIR)
+    preview_cache_dir = (
+        (getattr(shared.opts, "collection_preview_cache_dir", "") or "").strip()
+        or str(DEFAULT_IMAGE_CACHE_DIR / "preview")
+    )
+
+    full_download_dir = (
+        (getattr(shared.opts, "collection_full_download_dir", "") or "").strip()
+        or str(DEFAULT_IMAGE_CACHE_DIR / "full")
     )
 
     nsfw_filter_mode = (
@@ -57,11 +68,44 @@ def _settings() -> Dict[str, str]:
     if nsfw_filter_mode not in {"r_and_above", "x_and_above"}:
         nsfw_filter_mode = "r_and_above"
 
+    local_preview_cap_enabled = bool(
+        getattr(shared.opts, "collection_local_preview_cap_enabled", False)
+    )
+
+    local_preview_cap_raw = (
+        getattr(shared.opts, "collection_local_preview_cap", "") or ""
+    ).strip()
+    local_preview_cap_value = 0
+    if local_preview_cap_raw:
+        try:
+            local_preview_cap_value = max(0, int(local_preview_cap_raw))
+        except Exception:
+            local_preview_cap_value = 0
+
+    local_full_cap_enabled = bool(
+        getattr(shared.opts, "collection_local_full_cap_enabled", False)
+    )
+
+    local_full_cap_raw = (
+        getattr(shared.opts, "collection_local_full_cap", "") or ""
+    ).strip()
+    local_full_cap_value = 0
+    if local_full_cap_raw:
+        try:
+            local_full_cap_value = max(0, int(local_full_cap_raw))
+        except Exception:
+            local_full_cap_value = 0
+
     return {
         "api_key": api_key,
         "source_mode": source_mode,
-        "image_cache_dir": image_cache_dir,
+        "preview_cache_dir": preview_cache_dir,
+        "full_download_dir": full_download_dir,
         "nsfw_filter_mode": nsfw_filter_mode,
+        "local_preview_cap_enabled": local_preview_cap_enabled,
+        "local_preview_cap_value": local_preview_cap_value,
+        "local_full_cap_enabled": local_full_cap_enabled,
+        "local_full_cap_value": local_full_cap_value,
     }
 
 
@@ -88,6 +132,17 @@ def _is_video_path(path_or_url: str) -> bool:
 
     return suffix in {".mp4", ".webm", ".mov"}
 
+
+def _item_is_video(item: Dict[str, Any]) -> bool:
+    media_type = (item.get("media_type") or "").strip().lower()
+    if media_type.startswith("video/"):
+        return True
+    if media_type == "video":
+        return True
+
+    preview_source = item.get("preview_path") or item.get("image_url") or ""
+    return _is_video_path(preview_source)
+
 def _to_browser_src(path_or_url: str) -> str:
     if not path_or_url:
         return ""
@@ -99,52 +154,103 @@ def _to_browser_src(path_or_url: str) -> str:
     local_path = Path(path_or_url).resolve()
     return f"/file={quote(str(local_path))}"
 
+def _slugify_collection_name(name: str) -> str:
+    value = (name or "").strip().lower()
+    value = re.sub(r"[^\w\s-]", "", value)
+    value = re.sub(r"[-\s]+", "_", value).strip("_")
+    return value or "collection"
 
-def _download_preview_image(image_url: str, image_cache_dir: str, image_id: Optional[int]) -> str:
-    if not image_url:
+def _get_collection_cache_dir(image_cache_dir: str, collection_name: str, collection_id: int) -> Path:
+    base_dir = Path(image_cache_dir)
+    folder_name = f"{_slugify_collection_name(collection_name)}_{collection_id}"
+    return base_dir / folder_name
+
+
+def _get_media_root_dirs(settings: Dict[str, Any]) -> List[Path]:
+    return [
+        Path(settings["preview_cache_dir"]),
+        Path(settings["full_download_dir"]),
+    ]
+
+def _remove_empty_dirs(root_dir: Path) -> int:
+    removed = 0
+
+    if not root_dir.exists():
+        return removed
+
+    for directory in sorted(
+        [p for p in root_dir.rglob("*") if p.is_dir()],
+        key=lambda p: len(p.parts),
+        reverse=True,
+    ):
+        try:
+            if not any(directory.iterdir()):
+                directory.rmdir()
+                removed += 1
+        except Exception:
+            pass
+
+    return removed
+
+
+def _download_media_file(media_url: str, cache_dir: Path, media_id: Optional[int]) -> str:
+    if not media_url:
         return ""
 
-    cache_dir = Path(image_cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    image_key = str(image_id) if image_id is not None else hashlib.sha1(image_url.encode("utf-8")).hexdigest()
+    image_key = str(media_id) if media_id is not None else hashlib.sha1(media_url.encode("utf-8")).hexdigest()
+    suffix = _safe_suffix_from_url(media_url)
 
-    # Try to detect suffix first (may be empty)
-    suffix = _safe_suffix_from_url(image_url)
-
-    # If suffix is known, check cache BEFORE downloading
     if suffix:
         local_path = cache_dir / f"{image_key}{suffix}"
         if local_path.exists():
             return local_path.as_posix()
 
-    # Otherwise fetch to determine content type
-    response = requests.get(image_url, timeout=60)
-    response.raise_for_status()
+    retry_delays = [2, 5, 10]
+    last_exception: Optional[Exception] = None
 
-    if not suffix:
-        content_type = (response.headers.get("Content-Type") or "").lower()
-        if "video/mp4" in content_type:
-            suffix = ".mp4"
-        elif "video/webm" in content_type:
-            suffix = ".webm"
-        elif "video/quicktime" in content_type:
-            suffix = ".mov"
-        elif "image/png" in content_type:
-            suffix = ".png"
-        elif "image/webp" in content_type:
-            suffix = ".webp"
-        elif "image/gif" in content_type:
-            suffix = ".gif"
-        else:
-            suffix = ".jpg"
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            response = requests.get(media_url, timeout=30)
+            response.raise_for_status()
 
-    local_path = cache_dir / f"{image_key}{suffix}"
+            resolved_suffix = suffix
+            if not resolved_suffix:
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "video/mp4" in content_type:
+                    resolved_suffix = ".mp4"
+                elif "video/webm" in content_type:
+                    resolved_suffix = ".webm"
+                elif "video/quicktime" in content_type:
+                    resolved_suffix = ".mov"
+                elif "image/png" in content_type:
+                    resolved_suffix = ".png"
+                elif "image/webp" in content_type:
+                    resolved_suffix = ".webp"
+                elif "image/gif" in content_type:
+                    resolved_suffix = ".gif"
+                else:
+                    resolved_suffix = ".jpg"
 
-    if not local_path.exists():
-        local_path.write_bytes(response.content)
+            local_path = cache_dir / f"{image_key}{resolved_suffix}"
 
-    return local_path.as_posix()
+            if not local_path.exists():
+                local_path.write_bytes(response.content)
+
+            time.sleep(0.5)
+            return local_path.as_posix()
+
+        except Exception as exc:
+            last_exception = exc
+            if attempt < len(retry_delays):
+                delay = retry_delays[attempt]
+                print(f"  MEDIA DOWNLOAD RETRY {attempt + 1} for media {media_id}: {exc!r} — waiting {delay}s")
+                time.sleep(delay)
+            else:
+                break
+
+    raise last_exception if last_exception else RuntimeError("Media download failed without exception")
 
 
 def _render_sfw_indicator() -> str:
@@ -178,6 +284,57 @@ def _all_collections() -> List[Dict[str, Any]]:
     local = db.list_collections("local")
     return synced + local
 
+def _get_collection_cache_status(collection: Dict[str, Any]) -> Dict[str, Any]:
+    db = _get_db()
+    collection_id = int(collection["id"])
+    collection_type = (collection.get("type") or "").strip().lower()
+    items = db.list_items_for_collection(collection_id)
+
+    if not items:
+        if collection_type == "synced":
+            label = "Synced-Remote"
+        else:
+            label = "Local"
+        return {
+            "label": label,
+            "cached_count": 0,
+            "total_count": 0,
+        }
+
+    preview_count = 0
+    full_count = 0
+
+    for item in items:
+        preview_path = (item.get("preview_path") or "").strip()
+        full_path = (item.get("full_path") or "").strip()
+
+        if preview_path and Path(preview_path).exists():
+            preview_count += 1
+        if full_path and Path(full_path).exists():
+            full_count += 1
+
+    total_count = len(items)
+
+    if collection_type == "synced":
+        if full_count >= total_count and total_count > 0:
+            label = "Synced-Local Full"
+            cached_count = full_count
+        elif preview_count > 0:
+            label = "Synced-Local Prvw"
+            cached_count = preview_count
+        else:
+            label = "Synced-Remote"
+            cached_count = 0
+    else:
+        label = "Local"
+        cached_count = preview_count
+
+    return {
+        "label": label,
+        "cached_count": cached_count,
+        "total_count": total_count,
+    }
+
 
 def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> str:
     collections = _all_collections()
@@ -186,9 +343,19 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
     for collection in collections:
         cid = int(collection["id"])
         name = html.escape(collection["name"])
-        ctype = html.escape(collection["type"].title())
         item_count = int(collection.get("item_count", 0))
         active = cid == selected_collection_id
+
+        cache_status = _get_collection_cache_status(collection)
+        cache_label_raw = (cache_status["label"] or "").strip()
+        cached_count = int(cache_status["cached_count"])
+        total_count = int(cache_status["total_count"])
+
+        # Strip prefixes so we only show Prvw / Full / Remote
+        display_label = cache_label_raw.replace("Synced-Local ", "")
+        display_label = display_label.replace("Synced-", "")
+
+        cache_label = html.escape(display_label)
 
         bg = "#202020" if active else "transparent"
         border = "#4b4b4b" if active else "transparent"
@@ -228,7 +395,9 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
                             overflow:hidden;
                             text-overflow:ellipsis;
                         ">{name}</div>
-                        <div style="font-size:11px; color:#8f8f8f; margin-top:2px;">{ctype}</div>
+                        <div style="font-size:11px; color:#8f8f8f; margin-top:2px;">
+                            {cache_label} ({cached_count}/{total_count})
+                        </div>
                     </div>
                     <div style="font-size:11px; color:#9a9a9a; flex:0 0 auto;">{item_count}</div>
                 </div>
@@ -384,7 +553,7 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
         title = item.get("title") or "Untitled"
         safe_title = html.escape(title)
 
-        is_mp4 = _is_video_path(preview_source)
+        is_mp4 = _item_is_video(item)
 
         thumb_html = ""
         if image_url and not is_mp4:
@@ -653,26 +822,30 @@ def _toggle_nsfw_filter(selected_collection_id_raw: str):
 
 
 def _clear_cache() -> str:
-    cache_dir = Path(DEFAULT_IMAGE_CACHE_DIR)
-    removed = 0
+    settings = _settings()
+    removed_files = 0
+    removed_dirs = 0
 
-    if cache_dir.exists():
-        for f in cache_dir.iterdir():
-            if f.is_file():
-                try:
-                    f.unlink()
-                    removed += 1
-                except Exception:
-                    pass
+    for root_dir in _get_media_root_dirs(settings):
+        if root_dir.exists():
+            for f in root_dir.rglob("*"):
+                if f.is_file():
+                    try:
+                        f.unlink()
+                        removed_files += 1
+                    except Exception:
+                        pass
 
-    return f"Cache cleared: {removed} file(s) removed."
+            removed_dirs += _remove_empty_dirs(root_dir)
+
+    return f"Cache cleared: {removed_files} file(s) removed, {removed_dirs} empty folder(s) removed."
 
 
 def _reset_extension() -> tuple[str, str]:
     global _db
 
     db_path = Path(DEFAULT_DB_PATH)
-    cache_dir = Path(DEFAULT_IMAGE_CACHE_DIR)
+    settings = _settings()
 
     # Close DB connection
     _db = None
@@ -684,14 +857,17 @@ def _reset_extension() -> tuple[str, str]:
         except Exception:
             pass
 
-    # Clear cache folder
-    if cache_dir.exists():
-        for f in cache_dir.iterdir():
-            if f.is_file():
-                try:
-                    f.unlink()
-                except Exception:
-                    pass
+    # Clear media folders
+    for root_dir in _get_media_root_dirs(settings):
+        if root_dir.exists():
+            for f in root_dir.rglob("*"):
+                if f.is_file():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+
+            _remove_empty_dirs(root_dir)
 
     # Recreate fresh DB
     db = _get_db()
@@ -701,27 +877,214 @@ def _reset_extension() -> tuple[str, str]:
         "Extension reset complete.",
     )
 
-def _request_stop_sync() -> str:
-    global _stop_sync
-    _stop_sync = True
-    return "Stopping sync after current collection..."
+def _request_stop_jobs() -> str:
+    global _stop_requested
+    _stop_requested = True
+    return "Stopping active job after current item..."
+
+
+def _get_image_detail_for_sync(
+    client: CivitaiClient,
+    image_id: Optional[int],
+) -> Dict[str, Any]:
+    if not image_id:
+        return {}
+
+    return client.get_image_by_id(int(image_id))
+
+
+def _safe_get(d: Dict[str, Any], *keys, default=None):
+    current = d
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+        if current is None:
+            return default
+    return current
+
+
+def _extract_generation_core(detail: Dict[str, Any]) -> Dict[str, Any]:
+    meta = detail.get("meta") or {}
+    metadata = detail.get("metadata") or {}
+    generation = detail.get("generation") or {}
+    gen_meta = generation.get("meta") or {}
+
+    # Prefer generation data first
+    steps = gen_meta.get("steps") or meta.get("steps") or metadata.get("steps")
+    cfg_scale = gen_meta.get("cfgScale") or meta.get("cfgScale") or metadata.get("cfgScale")
+    sampler = gen_meta.get("sampler") or meta.get("sampler") or metadata.get("sampler")
+    seed = gen_meta.get("seed") or meta.get("seed") or metadata.get("seed")
+    clip_skip = gen_meta.get("clipSkip") or meta.get("clipSkip") or metadata.get("clipSkip")
+
+    width = gen_meta.get("width") or metadata.get("width")
+    height = gen_meta.get("height") or metadata.get("height")
+
+    return {
+        "steps": steps,
+        "cfg_scale": cfg_scale,
+        "sampler": sampler,
+        "seed": seed,
+        "clip_skip": clip_skip,
+        "width": width,
+        "height": height,
+    }
+
+def _store_generation_params(db: CollectionDatabase, item_id: int, detail: Dict[str, Any]):
+    generation = detail.get("generation") or {}
+    meta = generation.get("meta") or detail.get("meta") or {}
+
+    db.clear_generation_params_for_item(item_id)
+
+    for key, value in meta.items():
+        if value is None:
+            continue
+
+        db.add_generation_param(
+            item_id=item_id,
+            param_key=str(key),
+            param_value=str(value),
+            value_type=type(value).__name__,
+            display_group="core",
+            source_path=f"generation.meta.{key}" if generation.get("meta") else f"meta.{key}",
+        )
+
+
+def _to_float(value: Any, default: float = 1.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _normalize_resource_type(value: Any) -> str:
+    raw = str(value or "").strip().lower().replace(" ", "").replace("_", "")
+
+    mapping = {
+        "checkpoint": "checkpoint",
+        "model": "checkpoint",
+        "lora": "lora",
+        "loramodel": "lora",
+        "textualinversion": "embedding",
+        "embedding": "embedding",
+        "upscaler": "upscaler",
+        "workflow": "workflow",
+        "workflows": "workflow",
+    }
+
+    return mapping.get(raw, raw or "resource")
+
+
+def _extract_generation_identity(detail: Dict[str, Any]) -> Dict[str, Any]:
+    generation = detail.get("generation") or {}
+    gen_meta = generation.get("meta") or {}
+    resources = generation.get("resources") or []
+
+    generator_name = str(gen_meta.get("Version") or "").strip()
+    generator_type = ""
+    has_generation_data = 1 if gen_meta else 0
+    is_external_generator = 1 if generation.get("external") else 0
+
+    checkpoint_name = str(gen_meta.get("Model") or "").strip()
+    checkpoint_version = ""
+    vae_name = str(gen_meta.get("VAE") or "").strip()
+
+    for resource in resources:
+        model_type = _normalize_resource_type(resource.get("modelType"))
+        if model_type == "checkpoint":
+            if not checkpoint_name:
+                checkpoint_name = str(resource.get("modelName") or "").strip()
+            break
+
+    if generator_name:
+        generator_type = "internal"
+
+    if is_external_generator:
+        generator_type = "external"
+
+    return {
+        "generator_name": generator_name,
+        "generator_type": generator_type,
+        "has_generation_data": has_generation_data,
+        "is_external_generator": is_external_generator,
+        "checkpoint_name": checkpoint_name,
+        "checkpoint_version": checkpoint_version,
+        "vae_name": vae_name,
+    }
+
+
+def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any]) -> None:
+    generation = detail.get("generation") or {}
+    generation_resources = generation.get("resources") or []
+    gen_meta = generation.get("meta") or {}
+    meta_resources = gen_meta.get("resources") or []
+
+    db.clear_resources_for_item(item_id)
+
+    for resource in generation_resources:
+        resource_type = _normalize_resource_type(resource.get("modelType"))
+        name = str(resource.get("modelName") or "").strip()
+        version_name = str(resource.get("versionName") or "").strip()
+        if not name:
+            continue
+
+        db.add_resource(
+            item_id=item_id,
+            resource_type=resource_type,
+            name=name,
+            version_name=version_name,
+            weight=1.0,
+            model_id=resource.get("modelId"),
+            version_id=resource.get("versionId"),
+            local_status="red",
+            local_filename=None,
+        )
+
+    if generation_resources:
+        return
+
+    for resource in meta_resources:
+        resource_type = _normalize_resource_type(resource.get("type"))
+        name = str(resource.get("name") or "").strip()
+        version_name = ""
+        weight = _to_float(resource.get("weight"), default=1.0)
+
+        if not name:
+            continue
+
+        db.add_resource(
+            item_id=item_id,
+            resource_type=resource_type,
+            name=name,
+            version_name=version_name,
+            weight=weight,
+            model_id=None,
+            version_id=None,
+            local_status="red",
+            local_filename=None,
+        )
 
 
 def _sync_collections() -> tuple[str, str]:
-    global _stop_sync
-    _stop_sync = False
+    global _stop_requested
+    _stop_requested = False
 
     settings = _settings()
     api_key = settings["api_key"]
     source_mode = settings["source_mode"]
-    image_cache_dir = settings["image_cache_dir"]
+    preview_cache_dir = settings["preview_cache_dir"]
+    full_download_dir = settings["full_download_dir"]
 
     print("SYNC FUNCTION STARTED")
     print("api_key present:", bool(api_key))
     print("source_mode:", source_mode)
-    print("image_cache_dir:", image_cache_dir)
+    print("preview_cache_dir:", preview_cache_dir)
+    print("full_download_dir:", full_download_dir)
 
-    Path(image_cache_dir).mkdir(parents=True, exist_ok=True)
+    for root_dir in _get_media_root_dirs(settings):
+        root_dir.mkdir(parents=True, exist_ok=True)
 
     db = _get_db()
     client = CivitaiClient(
@@ -736,10 +1099,12 @@ def _sync_collections() -> tuple[str, str]:
         print("FETCHED COLLECTION COUNT:", len(collections))
 
         synced_count = 0
+        partial_sync_detected = False
+        partial_sync_reason = ""
 
         for collection in collections:
-            if _stop_sync:
-                print("SYNC STOP REQUESTED — stopping before next collection")
+            if _stop_requested:
+                print("STOP REQUESTED — stopping sync before next collection")
                 break
 
             collection_id = collection.get("id")
@@ -753,8 +1118,6 @@ def _sync_collections() -> tuple[str, str]:
             if not collection_id:
                 continue
 
-            print(f"SYNCING COLLECTION: {collection_name} ({collection_id})")
-
             local_collection_id = db.get_or_create_collection(
                 name=collection_name,
                 collection_type="synced",
@@ -767,7 +1130,17 @@ def _sync_collections() -> tuple[str, str]:
             # Only clear AFTER successful fetch
             db.clear_collection_items(local_collection_id)
 
+            consecutive_detail_failures = 0
+            collection_hydration_stopped_early = False
+
             for idx, image in enumerate(images):
+                if _stop_requested:
+                    print("STOP REQUESTED — stopping sync during image hydration")
+                    collection_hydration_stopped_early = True
+                    partial_sync_detected = True
+                    partial_sync_reason = "stopped by user during image detail hydration"
+                    break
+
                 meta = image.get("meta") or {}
                 user = image.get("user") or {}
 
@@ -775,47 +1148,135 @@ def _sync_collections() -> tuple[str, str]:
                 title = image.get("name") or f"Civitai Image {image_id}"
 
                 raw_url = image.get("url") or ""
-                image_url = (
+                filename = image.get("name") or ""
+                media_type = (image.get("mimeType") or image.get("type") or "").strip().lower()
+
+                preview_url = (
                     f"https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/{raw_url}/width=512"
                     if raw_url else ""
                 )
 
-                preview_path = ""
-                if image_url:
-                    try:
-                        preview_path = _download_preview_image(
-                            image_url=image_url,
-                            image_cache_dir=image_cache_dir,
-                            image_id=image_id,
+                if raw_url and filename:
+                    if media_type.startswith("video/") or media_type == "video":
+                        full_media_url = (
+                            f"https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/"
+                            f"{raw_url}/transcode=true,original=true,quality=90/{filename}"
                         )
-                    except Exception as preview_exc:
-                        print(f"  PREVIEW DOWNLOAD FAILED for image {image_id}: {preview_exc!r}")
+                    else:
+                        full_media_url = (
+                            f"https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/"
+                            f"{raw_url}/original=true,quality=90/{filename}"
+                        )
+                else:
+                    full_media_url = ""
+
+                detail_payload: Dict[str, Any] = {}
+                generation_payload: Dict[str, Any] = {}
+
+                if image_id:
+                    try:
+                        detail_payload = _get_image_detail_for_sync(client, image_id)
+
+                        try:
+                            generation_payload = client.get_image_generation_data(int(image_id))
+                            time.sleep(DETAIL_REQUEST_DELAY_SECONDS)
+                        except Exception as exc:
+                            print(f"  GENERATION DATA FETCH FAILED for image {image_id}: {exc!r}")
+
+                        consecutive_detail_failures = 0
+                        time.sleep(DETAIL_REQUEST_DELAY_SECONDS)
+
+                    except Exception as exc:
+                        print(f"  DETAIL FETCH FAILED for image {image_id}: {exc!r}")
+                        consecutive_detail_failures += 1
+                        detail_payload = {}
+                        generation_payload = {}
+
+                        if consecutive_detail_failures >= DETAIL_REQUEST_MAX_CONSECUTIVE_FAILURES:
+                            print(
+                                "  STOPPING DETAIL HYDRATION EARLY: "
+                                f"{consecutive_detail_failures} consecutive failures"
+                            )
+                            collection_hydration_stopped_early = True
+                            partial_sync_detected = True
+                            partial_sync_reason = (
+                                f"detail hydration stopped early after "
+                                f"{consecutive_detail_failures} consecutive failures"
+                            )
+                            break
+
+                        time.sleep(DETAIL_REQUEST_FAILURE_BACKOFF_SECONDS)
+
+                metadata_source = detail_payload or image
+
+                if generation_payload:
+                    metadata_source = {
+                        **metadata_source,
+                        "generation": generation_payload,
+                    }
+
+                detail_meta = metadata_source.get("meta") or meta
+                generation_meta = (metadata_source.get("generation") or {}).get("meta") or {}
+                detail_user = metadata_source.get("user") or user
+                raw_metadata_payload = metadata_source
+
+                core = _extract_generation_core(metadata_source)
+                identity = _extract_generation_identity(metadata_source)
 
                 item_id = db.create_item(
+                    civitai_image_id=image_id,
                     civitai_post_id=image.get("postId"),
                     title=title,
-                    image_url=image_url,
-                    preview_path=preview_path,
+                    image_url=preview_url,
+                    full_media_url=full_media_url,
+                    preview_path="",
                     full_path="",
-                    download_status="preview" if preview_path else "none",
-                    creator_name=user.get("username") or "Unknown",
+                    download_status="none",
+                    creator_name=detail_user.get("username") or user.get("username") or "Unknown",
                     creator_url="",
                     post_url=f"https://civitai.com/images/{image_id}" if image_id else "",
                     rating=str(image.get("nsfwLevel", "Unknown")),
                     platform="Civitai",
-                    prompt=meta.get("prompt") or "",
-                    negative_prompt=meta.get("negativePrompt") or "",
-                    metadata_json=json.dumps(image),
+                    media_type=media_type,
+                    prompt=generation_meta.get("prompt") or detail_meta.get("prompt") or meta.get("prompt") or "",
+                    negative_prompt=generation_meta.get("negativePrompt") or detail_meta.get("negativePrompt") or meta.get("negativePrompt") or "",
+                    metadata_json=json.dumps(raw_metadata_payload),
+
+                    generator_name=identity["generator_name"],
+                    generator_type=identity["generator_type"],
+                    has_generation_data=identity["has_generation_data"],
+                    is_external_generator=identity["is_external_generator"],
+
+                    steps=core["steps"],
+                    cfg_scale=core["cfg_scale"],
+                    sampler=core["sampler"],
+                    seed=core["seed"],
+                    clip_skip=core["clip_skip"],
+                    width=core["width"],
+                    height=core["height"],
+
+                    checkpoint_name=identity["checkpoint_name"],
+                    checkpoint_version=identity["checkpoint_version"],
+                    vae_name=identity["vae_name"],
                 )
+
+                _store_generation_params(db, item_id, metadata_source)
+                _store_resources(db, item_id, metadata_source)
 
                 db.add_item_to_collection(local_collection_id, item_id, idx)
 
             synced_count += 1
 
-        if _stop_sync:
+        if _stop_requested:
             return (
                 _refresh_sidebar_payload(),
                 f"Sync stopped by user: {synced_count} collection(s) synced before stopping.",
+            )
+
+        if partial_sync_detected:
+            return (
+                _refresh_sidebar_payload(),
+                f"Sync partially completed: {synced_count} collection(s) synced. Reason: {partial_sync_reason}.",
             )
 
         return (
@@ -829,6 +1290,298 @@ def _sync_collections() -> tuple[str, str]:
             _refresh_sidebar_payload(),
             f"Sync failed: {html.escape(str(exc))}",
         )
+
+def _cache_selected_collection(selected_collection_id_raw: str) -> tuple[str, str, str]:
+    selected_collection_id: Optional[int] = None
+
+    global _stop_requested
+    _stop_requested = False
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not selected_collection_id:
+        return (
+            _refresh_sidebar_payload(),
+            _render_feed_html(None),
+            "No collection selected.",
+        )
+
+    db = _get_db()
+    collection = db.get_collection(selected_collection_id)
+    if not collection:
+        return (
+            _refresh_sidebar_payload(),
+            _render_feed_html(None),
+            "Selected collection was not found.",
+        )
+
+    if collection.get("type") != "synced":
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Only synced collections can be cached locally.",
+        )
+
+    settings = _settings()
+    preview_cache_dir = settings["preview_cache_dir"]
+    local_preview_cap_enabled = bool(settings["local_preview_cap_enabled"])
+    local_preview_cap_value = int(settings["local_preview_cap_value"])
+
+    collection_name = collection.get("name") or f"collection_{selected_collection_id}"
+    cache_dir = _get_collection_cache_dir(
+        image_cache_dir=preview_cache_dir,
+        collection_name=collection_name,
+        collection_id=selected_collection_id,
+    )
+
+    items = db.list_items_for_collection(selected_collection_id)
+
+    uncached_items: List[Dict[str, Any]] = []
+    for item in items:
+        preview_path = (item.get("preview_path") or "").strip()
+        if preview_path and Path(preview_path).exists():
+            continue
+        uncached_items.append(item)
+
+    batch_limit = (
+        local_preview_cap_value
+        if local_preview_cap_enabled and local_preview_cap_value > 0
+        else None
+    )
+    if batch_limit is not None:
+        items_to_cache = uncached_items[:batch_limit]
+    else:
+        items_to_cache = uncached_items
+
+    downloaded = 0
+    skipped = len(items) - len(uncached_items)
+    failed = 0
+    consecutive_failures = 0
+    stopped_early = False
+
+    print(f"CACHING COLLECTION: {collection_name} ({selected_collection_id})")
+    print(f"CACHE DIRECTORY: {cache_dir.as_posix()}")
+    print(f"ITEM COUNT: {len(items)}")
+    print(f"UNCACHED ITEM COUNT: {len(uncached_items)}")
+    if batch_limit is not None:
+        print(f"LOCAL PREVIEW CAP APPLIED: {batch_limit}")
+        print(f"BATCH ITEM COUNT: {len(items_to_cache)}")
+    for item in items_to_cache:
+        if _stop_requested:
+            print("STOP REQUESTED — stopping preview download run")
+            stopped_early = True
+            break
+
+        item_id = int(item["id"])
+        image_url = (item.get("image_url") or "").strip()
+
+        if not image_url:
+            failed += 1
+            consecutive_failures += 1
+        else:
+            try:
+                local_path = _download_media_file(
+                    media_url=image_url,
+                    cache_dir=cache_dir,
+                    media_id=item.get("civitai_image_id") or item_id,
+                )
+                db.update_item_preview_state(
+                    item_id=item_id,
+                    preview_path=local_path,
+                    download_status="preview",
+                )
+                downloaded += 1
+                consecutive_failures = 0
+            except Exception as exc:
+                print(f"  PREVIEW DOWNLOAD FAILED for item {item_id}: {exc!r}")
+                failed += 1
+                consecutive_failures += 1
+
+        if consecutive_failures >= 3:
+            cooldown = 15
+            print(f"  ADAPTIVE COOLDOWN: {consecutive_failures} consecutive failures — waiting {cooldown}s")
+            time.sleep(cooldown)
+
+        if consecutive_failures >= 5:
+            print("  STOPPING CACHE RUN EARLY: too many consecutive failures")
+            stopped_early = True
+            break
+
+    cap_note = ""
+    if batch_limit is not None:
+        cap_note = f" Batch cap: {batch_limit}."
+
+    if stopped_early:
+        status = (
+            f"Preview download paused for '{collection_name}': "
+            f"{downloaded} downloaded, {skipped} already downloaded, {failed} failed. "
+            f"Stopped early.{cap_note}"
+        )
+    else:
+        status = (
+            f"Preview download complete for '{collection_name}': "
+            f"{downloaded} downloaded, {skipped} already downloaded, {failed} failed.{cap_note}"
+        )
+
+    return (
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+        status,
+    )
+
+
+def _full_download_selected_collection(selected_collection_id_raw: str) -> tuple[str, str, str]:
+    selected_collection_id: Optional[int] = None
+
+    global _stop_requested
+    _stop_requested = False
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not selected_collection_id:
+        return (
+            _refresh_sidebar_payload(),
+            _render_feed_html(None),
+            "No collection selected.",
+        )
+
+    db = _get_db()
+    collection = db.get_collection(selected_collection_id)
+    if not collection:
+        return (
+            _refresh_sidebar_payload(),
+            _render_feed_html(None),
+            "Selected collection was not found.",
+        )
+
+    if collection.get("type") != "synced":
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Only synced collections can be downloaded locally.",
+        )
+
+    settings = _settings()
+    full_download_dir = settings["full_download_dir"]
+    local_full_cap_enabled = bool(settings["local_full_cap_enabled"])
+    local_full_cap_value = int(settings["local_full_cap_value"])
+
+    collection_name = collection.get("name") or f"collection_{selected_collection_id}"
+    cache_dir = _get_collection_cache_dir(
+        image_cache_dir=full_download_dir,
+        collection_name=collection_name,
+        collection_id=selected_collection_id,
+    )
+
+    items = db.list_items_for_collection(selected_collection_id)
+
+    undownloaded_items: List[Dict[str, Any]] = []
+    for item in items:
+        full_path = (item.get("full_path") or "").strip()
+        if full_path and Path(full_path).exists():
+            continue
+        undownloaded_items.append(item)
+
+    batch_limit = (
+        local_full_cap_value
+        if local_full_cap_enabled and local_full_cap_value > 0
+        else None
+    )
+    if batch_limit is not None:
+        items_to_download = undownloaded_items[:batch_limit]
+    else:
+        items_to_download = undownloaded_items
+
+    downloaded = 0
+    skipped = len(items) - len(undownloaded_items)
+    failed = 0
+    consecutive_failures = 0
+    stopped_early = False
+
+    print(f"FULL DOWNLOADING COLLECTION: {collection_name} ({selected_collection_id})")
+    print(f"FULL DOWNLOAD DIRECTORY: {cache_dir.as_posix()}")
+    print(f"ITEM COUNT: {len(items)}")
+    print(f"UNDOWNLOADED ITEM COUNT: {len(undownloaded_items)}")
+    if batch_limit is not None:
+        print(f"LOCAL FULL CAP APPLIED: {batch_limit}")
+        print(f"FULL BATCH ITEM COUNT: {len(items_to_download)}")
+
+    for item in items_to_download:
+        if _stop_requested:
+            print("STOP REQUESTED — stopping full download run")
+            stopped_early = True
+            break
+
+        item_id = int(item["id"])
+        full_media_url = (item.get("full_media_url") or "").strip()
+
+        if not full_media_url:
+            failed += 1
+            consecutive_failures += 1
+        else:
+            try:
+                local_path = _download_media_file(
+                    media_url=full_media_url,
+                    cache_dir=cache_dir,
+                    media_id=item.get("civitai_image_id") or item_id,
+                )
+                db.update_item_full_state(
+                    item_id=item_id,
+                    full_path=local_path,
+                    download_status="full",
+                )
+                downloaded += 1
+                consecutive_failures = 0
+            except Exception as exc:
+                print(f"  FULL DOWNLOAD FAILED for item {item_id}: {exc!r}")
+                failed += 1
+                consecutive_failures += 1
+
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code == 404:
+                    print("  STOPPING FULL DOWNLOAD RUN EARLY: received 404")
+                    stopped_early = True
+                    break
+
+        if consecutive_failures >= 3:
+            cooldown = 15
+            print(f"  ADAPTIVE COOLDOWN: {consecutive_failures} consecutive failures — waiting {cooldown}s")
+            time.sleep(cooldown)
+
+        if consecutive_failures >= 5:
+            print("  STOPPING FULL DOWNLOAD RUN EARLY: too many consecutive failures")
+            stopped_early = True
+            break
+
+    cap_note = ""
+    if batch_limit is not None:
+        cap_note = f" Batch cap: {batch_limit}."
+
+    if stopped_early:
+        status = (
+            f"Full download paused for '{collection_name}': "
+            f"{downloaded} downloaded, {skipped} already downloaded, {failed} failed. "
+            f"Stopped early.{cap_note}"
+        )
+    else:
+        status = (
+            f"Full download complete for '{collection_name}': "
+            f"{downloaded} downloaded, {skipped} already downloaded, {failed} failed.{cap_note}"
+        )
+
+    return (
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+        status,
+    )
 
 
 def _get_item_detail(item_id: int) -> str:
@@ -882,11 +1635,66 @@ def on_ui_settings() -> None:
     )
 
     shared.opts.add_option(
-        "collection_cache_dir",
+        "collection_preview_cache_dir",
         shared.OptionInfo(
-            str(DEFAULT_IMAGE_CACHE_DIR),
-            "Image Cache Directory",
+            str(DEFAULT_IMAGE_CACHE_DIR / "preview"),
+            "Directory For Preview Images",
             gr.Textbox,
+            {},
+            section=section,
+        ),
+    )
+
+    shared.opts.add_option(
+        "collection_full_download_dir",
+        shared.OptionInfo(
+            str(DEFAULT_IMAGE_CACHE_DIR / "full"),
+            "Directory For Full Image Downloads",
+            gr.Textbox,
+            {},
+            section=section,
+        ),
+    )
+
+    shared.opts.add_option(
+        "collection_local_preview_cap",
+        shared.OptionInfo(
+            "",
+            "Max Files per Collection for Local Preview Images",
+            gr.Textbox,
+            {"placeholder": "0000"},
+            section=section,
+        ).info("Leave blank for no cap. Applies only to downloaded preview files."),
+    )
+
+    shared.opts.add_option(
+        "collection_local_preview_cap_enabled",
+        shared.OptionInfo(
+            False,
+            "Implement Cap On Local Cached Preview Collections",
+            gr.Checkbox,
+            {},
+            section=section,
+        ),
+    )
+
+    shared.opts.add_option(
+        "collection_local_full_cap",
+        shared.OptionInfo(
+            "",
+            "Max Files per Collection for Local Full-Size Images",
+            gr.Textbox,
+            {"placeholder": "0000"},
+            section=section,
+        ).info("Leave blank for no cap. Applies only to downloaded full-size files."),
+    )
+
+    shared.opts.add_option(
+        "collection_local_full_cap_enabled",
+        shared.OptionInfo(
+            False,
+            "Implement Cap On Local Full Download Collections",
+            gr.Checkbox,
             {},
             section=section,
         ),
@@ -1025,7 +1833,9 @@ def on_ui_tabs():
 
                 with gr.Row():
                     sync_button = gr.Button("Sync collections", variant="primary")
-                    stop_button = gr.Button("Stop Sync", variant="stop")
+                    preview_download_button = gr.Button("Preview Download")
+                    full_download_button = gr.Button("Full Download")
+                    stop_button = gr.Button("Stop", variant="stop")
                     refresh_button = gr.Button("Refresh")
                     clear_cache_button = gr.Button("Clear Cache")
                     reset_button = gr.Button("Reset", variant="stop")
@@ -1060,9 +1870,21 @@ def on_ui_tabs():
         )
 
         stop_button.click(
-            fn=_request_stop_sync,
+            fn=_request_stop_jobs,
             inputs=[],
             outputs=[status_markdown],
+        )
+
+        preview_download_button.click(
+            fn=_cache_selected_collection,
+            inputs=[selected_collection_id],
+            outputs=[sidebar_html, feed_html, status_markdown],
+        )
+
+        full_download_button.click(
+            fn=_full_download_selected_collection,
+            inputs=[selected_collection_id],
+            outputs=[sidebar_html, feed_html, status_markdown],
         )
 
         refresh_button.click(

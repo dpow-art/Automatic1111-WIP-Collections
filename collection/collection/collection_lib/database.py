@@ -29,18 +29,49 @@ class CollectionDatabase:
 
                 CREATE TABLE IF NOT EXISTS items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    civitai_image_id INTEGER,
                     civitai_post_id INTEGER,
                     title TEXT,
                     image_url TEXT,
-                    local_path TEXT,
+                    full_media_url TEXT,
+                    preview_path TEXT,
+                    full_path TEXT,
+                    download_status TEXT DEFAULT 'none',
                     creator_name TEXT,
                     creator_url TEXT,
                     post_url TEXT,
                     rating TEXT,
                     platform TEXT,
+                    media_type TEXT,
                     prompt TEXT,
                     negative_prompt TEXT,
                     metadata_json TEXT,
+
+                    generator_name TEXT,
+                    generator_type TEXT,
+                    has_generation_data INTEGER DEFAULT 0,
+                    is_external_generator INTEGER DEFAULT 0,
+
+                    steps INTEGER,
+                    cfg_scale REAL,
+                    sampler TEXT,
+                    scheduler TEXT,
+                    seed TEXT,
+                    clip_skip INTEGER,
+                    width INTEGER,
+                    height INTEGER,
+
+                    denoise_strength REAL,
+                    hires_enabled INTEGER DEFAULT 0,
+                    hires_upscaler TEXT,
+                    hires_steps INTEGER,
+                    hires_denoise_strength REAL,
+                    resize_mode TEXT,
+
+                    checkpoint_name TEXT,
+                    checkpoint_version TEXT,
+                    vae_name TEXT,
+
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -56,12 +87,25 @@ class CollectionDatabase:
                 CREATE TABLE IF NOT EXISTS resources (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER NOT NULL,
+                    resource_type TEXT,
                     name TEXT NOT NULL,
+                    version_name TEXT,
                     weight REAL DEFAULT 1.0,
                     model_id INTEGER,
                     version_id INTEGER,
                     local_status TEXT DEFAULT 'red',
                     local_filename TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS generation_params (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL,
+                    param_key TEXT NOT NULL,
+                    param_value TEXT,
+                    value_type TEXT,
+                    display_group TEXT,
+                    source_path TEXT,
+                    sort_order INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS settings (
@@ -71,6 +115,54 @@ class CollectionDatabase:
                 );
                 """
             )
+
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(items)").fetchall()
+            }
+            item_column_defs = {
+                "civitai_image_id": "INTEGER",
+                "media_type": "TEXT",
+                "full_media_url": "TEXT",
+                "creator_url": "TEXT",
+                "generator_name": "TEXT",
+                "generator_type": "TEXT",
+                "has_generation_data": "INTEGER DEFAULT 0",
+                "is_external_generator": "INTEGER DEFAULT 0",
+                "steps": "INTEGER",
+                "cfg_scale": "REAL",
+                "sampler": "TEXT",
+                "scheduler": "TEXT",
+                "seed": "TEXT",
+                "clip_skip": "INTEGER",
+                "width": "INTEGER",
+                "height": "INTEGER",
+                "denoise_strength": "REAL",
+                "hires_enabled": "INTEGER DEFAULT 0",
+                "hires_upscaler": "TEXT",
+                "hires_steps": "INTEGER",
+                "hires_denoise_strength": "REAL",
+                "resize_mode": "TEXT",
+                "checkpoint_name": "TEXT",
+                "checkpoint_version": "TEXT",
+                "vae_name": "TEXT",
+            }
+            for column_name, column_def in item_column_defs.items():
+                if column_name not in columns:
+                    conn.execute(f"ALTER TABLE items ADD COLUMN {column_name} {column_def}")
+
+            resource_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(resources)").fetchall()
+            }
+            resource_column_defs = {
+                "resource_type": "TEXT",
+                "version_name": "TEXT",
+            }
+            for column_name, column_def in resource_column_defs.items():
+                if column_name not in resource_columns:
+                    conn.execute(f"ALTER TABLE resources ADD COLUMN {column_name} {column_def}")
+          
 
     def create_collection(self, name: str, collection_type: str, civitai_id: Optional[int] = None) -> int:
         with self.connect() as conn:
@@ -94,6 +186,14 @@ class CollectionDatabase:
             rows = conn.execute(query, (collection_type,)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_collection(self, collection_id: int) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM collections WHERE id = ?",
+                (collection_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def list_items_for_collection(self, collection_id: int) -> List[Dict[str, Any]]:
         query = """
             SELECT i.*, ci.order_index
@@ -113,7 +213,7 @@ class CollectionDatabase:
                 return None
             detail = dict(row)
             detail["metadata_json"] = json.loads(detail.get("metadata_json") or "{}")
-            detail["loras"] = [
+            detail["resources"] = [
                 dict(r)
                 for r in conn.execute(
                     "SELECT * FROM resources WHERE item_id = ? ORDER BY id ASC", (item_id,)
@@ -199,33 +299,99 @@ class CollectionDatabase:
     def create_item(
         self,
         *,
+        civitai_image_id: Optional[int],
         civitai_post_id: Optional[int],
         title: str,
         image_url: str,
-        local_path: str,
+        full_media_url: str,
+        preview_path: str,
+        full_path: str = "",
+        download_status: str = "none",
         creator_name: str,
         creator_url: str,
         post_url: str,
         rating: str,
         platform: str,
+        media_type: str,
         prompt: str,
         negative_prompt: str,
         metadata_json: str,
+        generator_name: str = "",
+        generator_type: str = "",
+        has_generation_data: int = 0,
+        is_external_generator: int = 0,
+        steps: Optional[int] = None,
+        cfg_scale: Optional[float] = None,
+        sampler: str = "",
+        scheduler: str = "",
+        seed: str = "",
+        clip_skip: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        denoise_strength: Optional[float] = None,
+        hires_enabled: int = 0,
+        hires_upscaler: str = "",
+        hires_steps: Optional[int] = None,
+        hires_denoise_strength: Optional[float] = None,
+        resize_mode: str = "",
+        checkpoint_name: str = "",
+        checkpoint_version: str = "",
+        vae_name: str = "",
     ) -> int:
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO items (
-                    civitai_post_id, title, image_url, local_path, creator_name, creator_url,
-                    post_url, rating, platform, prompt, negative_prompt, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    civitai_image_id, civitai_post_id, title, image_url, full_media_url, preview_path, full_path, download_status,
+                    creator_name, creator_url, post_url, rating, platform, media_type, prompt, negative_prompt, metadata_json,
+                    generator_name, generator_type, has_generation_data, is_external_generator,
+                    steps, cfg_scale, sampler, scheduler, seed, clip_skip, width, height,
+                    denoise_strength, hires_enabled, hires_upscaler, hires_steps, hires_denoise_strength, resize_mode,
+                    checkpoint_name, checkpoint_version, vae_name
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    civitai_post_id, title, image_url, local_path, creator_name, creator_url,
-                    post_url, rating, platform, prompt, negative_prompt, metadata_json,
+                    civitai_image_id, civitai_post_id, title, image_url, full_media_url, preview_path, full_path, download_status,
+                    creator_name, creator_url, post_url, rating, platform, media_type, prompt, negative_prompt, metadata_json,
+                    generator_name, generator_type, has_generation_data, is_external_generator,
+                    steps, cfg_scale, sampler, scheduler, seed, clip_skip, width, height,
+                    denoise_strength, hires_enabled, hires_upscaler, hires_steps, hires_denoise_strength, resize_mode,
+                    checkpoint_name, checkpoint_version, vae_name,
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_item_preview_state(
+        self,
+        item_id: int,
+        preview_path: str,
+        download_status: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET preview_path = ?, download_status = ?
+                WHERE id = ?
+                """,
+                (preview_path, download_status, item_id),
+            )
+
+    def update_item_full_state(
+        self,
+        item_id: int,
+        full_path: str,
+        download_status: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET full_path = ?, download_status = ?
+                WHERE id = ?
+                """,
+                (full_path, download_status, item_id),
+            )
 
     def add_item_to_collection(self, collection_id: int, item_id: int, order_index: int = 0) -> None:
         with self.connect() as conn:
@@ -248,6 +414,8 @@ class CollectionDatabase:
         self,
         item_id: int,
         name: str,
+        resource_type: str = "",
+        version_name: str = "",
         weight: float = 1.0,
         model_id: Optional[int] = None,
         version_id: Optional[int] = None,
@@ -258,10 +426,20 @@ class CollectionDatabase:
             conn.execute(
                 """
                 INSERT INTO resources (
-                    item_id, name, weight, model_id, version_id, local_status, local_filename
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    item_id, resource_type, name, version_name, weight, model_id, version_id, local_status, local_filename
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (item_id, name, weight, model_id, version_id, local_status, local_filename),
+                (
+                    item_id,
+                    resource_type,
+                    name,
+                    version_name,
+                    weight,
+                    model_id,
+                    version_id,
+                    local_status,
+                    local_filename,
+                ),
             )
 
     def clear_resources_for_item(self, item_id: int) -> None:
@@ -269,6 +447,41 @@ class CollectionDatabase:
             conn.execute(
                 "DELETE FROM resources WHERE item_id = ?",
                 (item_id,),
+            )
+
+    def clear_generation_params_for_item(self, item_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM generation_params WHERE item_id = ?",
+                (item_id,),
+            )
+
+    def add_generation_param(
+        self,
+        item_id: int,
+        param_key: str,
+        param_value: str,
+        value_type: str = "string",
+        display_group: str = "",
+        source_path: str = "",
+        sort_order: int = 0,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO generation_params (
+                    item_id, param_key, param_value, value_type, display_group, source_path, sort_order
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item_id,
+                    param_key,
+                    param_value,
+                    value_type,
+                    display_group,
+                    source_path,
+                    sort_order,
+                ),
             )
 
 
@@ -291,7 +504,9 @@ class CollectionDatabase:
                 {
                     "title": "Painterly character study",
                     "image_url": "https://placehold.co/480x720/png",
-                    "local_path": "https://placehold.co/480x720/png",
+                    "preview_path": "https://placehold.co/480x720/png",
+                    "full_path": "",
+                    "download_status": "preview",
                     "creator_name": "Demo Creator",
                     "creator_url": "https://example.com/creator/demo",
                     "post_url": "https://example.com/post/1",
@@ -305,7 +520,9 @@ class CollectionDatabase:
                 {
                     "title": "Graphic poster concept",
                     "image_url": "https://placehold.co/720x960/png",
-                    "local_path": "https://placehold.co/720x960/png",
+                    "preview_path": "https://placehold.co/720x960/png",
+                    "full_path": "",
+                    "download_status": "preview",
                     "creator_name": "Demo Creator",
                     "creator_url": "https://example.com/creator/demo",
                     "post_url": "https://example.com/post/2",
@@ -322,12 +539,12 @@ class CollectionDatabase:
                 item_id = conn.execute(
                     """
                     INSERT INTO items (
-                        title, image_url, local_path, creator_name, creator_url,
+                        title, image_url, preview_path, full_path, download_status, creator_name, creator_url,
                         post_url, rating, platform, prompt, negative_prompt, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        item["title"], item["image_url"], item["local_path"], item["creator_name"],
+                        item["title"], item["image_url"], item["preview_path"], item["full_path"], item["download_status"], item["creator_name"],
                         item["creator_url"], item["post_url"], item["rating"], item["platform"],
                         item["prompt"], item["negative_prompt"], item["metadata_json"],
                     ),
