@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote
 
 import json
@@ -10,6 +10,19 @@ SOURCE_MODES = {
     "sfw": "https://civitai.com",
     "full": "https://civitai.red",
 }
+
+
+@dataclass
+class CollectionImagePage:
+    page_number: int
+    request_cursor: Optional[int]
+    next_cursor: Optional[int]
+    items: List[Dict[str, Any]]
+    first_image_id: Optional[int]
+    last_image_id: Optional[int]
+    first_created_at: Optional[str]
+    last_created_at: Optional[str]
+
 
 @dataclass
 class CivitaiClient:
@@ -39,13 +52,25 @@ class CivitaiClient:
 
     def _trpc_get(self, procedure: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         encoded_input = quote(json.dumps({"json": payload}, separators=(",", ":")))
-        response = requests.get(
-            f"{self.base_url}/api/trpc/{procedure}?input={encoded_input}",
-            headers=self._headers(),
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        return response.json()
+
+        last_exception = None
+
+        for attempt in range(3):
+            try:
+                response = requests.get(
+                    f"{self.base_url}/api/trpc/{procedure}?input={encoded_input}",
+                    headers=self._headers(),
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                return response.json()
+
+            except Exception as e:
+                last_exception = e
+                print(f"[CivitaiClient] Attempt {attempt+1}/3 failed for {procedure}: {repr(e)}")
+
+        print("[CivitaiClient] All retries failed.")
+        raise last_exception
 
     def get_all_user_collections(self) -> List[Dict[str, Any]]:
         if not self.api_key:
@@ -64,14 +89,23 @@ class CivitaiClient:
     def get_collection_images(
         self,
         collection_id: int,
+        on_page: Optional[Callable[[CollectionImagePage], None]] = None,
+        start_cursor: Optional[int] = None,
+        max_pages: Optional[int] = None,
+        max_items: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not self.api_key:
             return []
 
         all_items: List[Dict[str, Any]] = []
-        cursor: Optional[int] = None
+        cursor: Optional[int] = start_cursor
+        page_number = 0
 
         while True:
+            if max_pages is not None and page_number >= max_pages:
+                break
+
+            request_cursor = cursor
             payload_data: Dict[str, Any] = {
                 "collectionId": collection_id,
                 "period": "AllTime",
@@ -83,16 +117,50 @@ class CivitaiClient:
                 "authed": True,
             }
 
-            if cursor is not None:
-                payload_data["cursor"] = cursor
+            if request_cursor is not None:
+                payload_data["cursor"] = request_cursor
 
-            payload = self._trpc_get("image.getInfinite", payload_data)
+            try:
+                payload = self._trpc_get("image.getInfinite", payload_data)
+            except Exception as e:
+                print(f"[CivitaiClient] PAGE FETCH FAILED at cursor {request_cursor}: {repr(e)}")
+                print(f"[CivitaiClient] Stopping pagination early. Returning {len(all_items)} items.")
+                break
+
             json_data = payload.get("result", {}).get("data", {}).get("json", {}) or {}
 
             items = json_data.get("items", []) or []
             next_cursor = json_data.get("nextCursor")
+            page_number += 1
+
+            if max_items is not None:
+                remaining = max_items - len(all_items)
+                if remaining <= 0:
+                    break
+                if len(items) > remaining:
+                    items = items[:remaining]
+                    next_cursor = None
 
             all_items.extend(items)
+
+            first_image_id = items[0].get("id") if items else None
+            last_image_id = items[-1].get("id") if items else None
+            first_created_at = items[0].get("createdAt") if items else None
+            last_created_at = items[-1].get("createdAt") if items else None
+
+            if on_page is not None:
+                on_page(
+                    CollectionImagePage(
+                        page_number=page_number,
+                        request_cursor=request_cursor,
+                        next_cursor=next_cursor,
+                        items=items,
+                        first_image_id=first_image_id,
+                        last_image_id=last_image_id,
+                        first_created_at=first_created_at,
+                        last_created_at=last_created_at,
+                    )
+                )
 
             if not next_cursor:
                 break
@@ -100,3 +168,24 @@ class CivitaiClient:
             cursor = next_cursor
 
         return all_items    
+
+    def iter_collection_image_pages(
+        self,
+        collection_id: int,
+        start_cursor: Optional[int] = None,
+        max_pages: Optional[int] = None,
+        max_items: Optional[int] = None,
+    ) -> List[CollectionImagePage]:
+        pages: List[CollectionImagePage] = []
+
+        def _collect_page(page: CollectionImagePage) -> None:
+            pages.append(page)
+
+        self.get_collection_images(
+            collection_id=collection_id,
+            on_page=_collect_page,
+            start_cursor=start_cursor,
+            max_pages=max_pages,
+            max_items=max_items,
+        )
+        return pages

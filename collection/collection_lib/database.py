@@ -29,15 +29,20 @@ class CollectionDatabase:
 
                 CREATE TABLE IF NOT EXISTS items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    civitai_image_id INTEGER,
                     civitai_post_id INTEGER,
                     title TEXT,
                     image_url TEXT,
-                    local_path TEXT,
+                    full_media_url TEXT,
+                    preview_path TEXT,
+                    full_path TEXT,
+                    download_status TEXT DEFAULT 'none',
                     creator_name TEXT,
                     creator_url TEXT,
                     post_url TEXT,
                     rating TEXT,
                     platform TEXT,
+                    media_type TEXT,
                     prompt TEXT,
                     negative_prompt TEXT,
                     metadata_json TEXT,
@@ -72,6 +77,17 @@ class CollectionDatabase:
                 """
             )
 
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(items)").fetchall()
+            }
+            if "civitai_image_id" not in columns:
+                conn.execute("ALTER TABLE items ADD COLUMN civitai_image_id INTEGER")
+            if "media_type" not in columns:
+                conn.execute("ALTER TABLE items ADD COLUMN media_type TEXT")
+            if "full_media_url" not in columns:
+                conn.execute("ALTER TABLE items ADD COLUMN full_media_url TEXT")            
+
     def create_collection(self, name: str, collection_type: str, civitai_id: Optional[int] = None) -> int:
         with self.connect() as conn:
             cur = conn.execute(
@@ -93,6 +109,14 @@ class CollectionDatabase:
         with self.connect() as conn:
             rows = conn.execute(query, (collection_type,)).fetchall()
         return [dict(row) for row in rows]
+
+    def get_collection(self, collection_id: int) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM collections WHERE id = ?",
+                (collection_id,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def list_items_for_collection(self, collection_id: int) -> List[Dict[str, Any]]:
         query = """
@@ -199,15 +223,20 @@ class CollectionDatabase:
     def create_item(
         self,
         *,
+        civitai_image_id: Optional[int],
         civitai_post_id: Optional[int],
         title: str,
         image_url: str,
-        local_path: str,
+        full_media_url: str,
+        preview_path: str,
+        full_path: str = "",
+        download_status: str = "none",
         creator_name: str,
         creator_url: str,
         post_url: str,
         rating: str,
         platform: str,
+        media_type: str,
         prompt: str,
         negative_prompt: str,
         metadata_json: str,
@@ -216,16 +245,48 @@ class CollectionDatabase:
             cur = conn.execute(
                 """
                 INSERT INTO items (
-                    civitai_post_id, title, image_url, local_path, creator_name, creator_url,
-                    post_url, rating, platform, prompt, negative_prompt, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    civitai_image_id, civitai_post_id, title, image_url, full_media_url, preview_path, full_path, download_status, creator_name, creator_url,
+                    post_url, rating, platform, media_type, prompt, negative_prompt, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    civitai_post_id, title, image_url, local_path, creator_name, creator_url,
-                    post_url, rating, platform, prompt, negative_prompt, metadata_json,
+                    civitai_image_id, civitai_post_id, title, image_url, full_media_url, preview_path, full_path, download_status, creator_name, creator_url,
+                    post_url, rating, platform, media_type, prompt, negative_prompt, metadata_json,
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_item_preview_state(
+        self,
+        item_id: int,
+        preview_path: str,
+        download_status: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET preview_path = ?, download_status = ?
+                WHERE id = ?
+                """,
+                (preview_path, download_status, item_id),
+            )
+
+    def update_item_full_state(
+        self,
+        item_id: int,
+        full_path: str,
+        download_status: str,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE items
+                SET full_path = ?, download_status = ?
+                WHERE id = ?
+                """,
+                (full_path, download_status, item_id),
+            )
 
     def add_item_to_collection(self, collection_id: int, item_id: int, order_index: int = 0) -> None:
         with self.connect() as conn:
@@ -291,10 +352,11 @@ class CollectionDatabase:
                 {
                     "title": "Painterly character study",
                     "image_url": "https://placehold.co/480x720/png",
-                    "local_path": "https://placehold.co/480x720/png",
+                    "preview_path": "https://placehold.co/480x720/png",
+                    "full_path": "",
+                    "download_status": "preview",
                     "creator_name": "Demo Creator",
-                    "creator_url": "https://example.com/creator/demo",
-                    "post_url": "https://example.com/post/1",
+                    "creator_url": "https://example.com/creator/demo",                    "post_url": "https://example.com/post/1",
                     "rating": "PG",
                     "platform": "Automatic1111",
                     "prompt": "masterpiece, painterly portrait, dramatic lighting",
@@ -305,7 +367,9 @@ class CollectionDatabase:
                 {
                     "title": "Graphic poster concept",
                     "image_url": "https://placehold.co/720x960/png",
-                    "local_path": "https://placehold.co/720x960/png",
+                    "preview_path": "https://placehold.co/720x960/png",
+                    "full_path": "",
+                    "download_status": "preview",
                     "creator_name": "Demo Creator",
                     "creator_url": "https://example.com/creator/demo",
                     "post_url": "https://example.com/post/2",
@@ -322,12 +386,12 @@ class CollectionDatabase:
                 item_id = conn.execute(
                     """
                     INSERT INTO items (
-                        title, image_url, local_path, creator_name, creator_url,
+                        title, image_url, preview_path, full_path, download_status, creator_name, creator_url,
                         post_url, rating, platform, prompt, negative_prompt, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        item["title"], item["image_url"], item["local_path"], item["creator_name"],
+                        item["title"], item["image_url"], item["preview_path"], item["full_path"], item["download_status"], item["creator_name"],
                         item["creator_url"], item["post_url"], item["rating"], item["platform"],
                         item["prompt"], item["negative_prompt"], item["metadata_json"],
                     ),
