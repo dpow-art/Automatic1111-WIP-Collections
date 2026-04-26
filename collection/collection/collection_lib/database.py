@@ -93,6 +93,8 @@ class CollectionDatabase:
                     weight REAL DEFAULT 1.0,
                     model_id INTEGER,
                     version_id INTEGER,
+                    hash_sha256 TEXT,
+                    hash_autov2 TEXT,
                     local_status TEXT DEFAULT 'red',
                     local_filename TEXT
                 );
@@ -111,6 +113,28 @@ class CollectionDatabase:
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS civitai_hash_cache (
+                    file_hash TEXT PRIMARY KEY,
+                    model_id TEXT,
+                    version_id TEXT,
+                    hash_sha256 TEXT,
+                    hash_autov2 TEXT,
+                    raw_json TEXT,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS local_resource_files (
+                    file_path TEXT PRIMARY KEY,
+                    resource_type TEXT,
+                    file_size INTEGER,
+                    modified_at REAL,
+                    hash_sha256 TEXT,
+                    hash_autov2 TEXT,
+                    model_id TEXT,
+                    version_id TEXT,
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -158,11 +182,32 @@ class CollectionDatabase:
             resource_column_defs = {
                 "resource_type": "TEXT",
                 "version_name": "TEXT",
+                "hash_sha256": "TEXT",
+                "hash_autov2": "TEXT",
             }
             for column_name, column_def in resource_column_defs.items():
                 if column_name not in resource_columns:
                     conn.execute(f"ALTER TABLE resources ADD COLUMN {column_name} {column_def}")
-          
+
+            local_resource_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(local_resource_files)").fetchall()
+            }
+            local_resource_column_defs = {
+                "resource_type": "TEXT",
+                "file_size": "INTEGER",
+                "modified_at": "REAL",
+                "hash_sha256": "TEXT",
+                "hash_autov2": "TEXT",
+                "model_id": "TEXT",
+                "version_id": "TEXT",
+            }
+            for column_name, column_def in local_resource_column_defs.items():
+                if column_name not in local_resource_columns:
+                    conn.execute(f"ALTER TABLE local_resource_files ADD COLUMN {column_name} {column_def}")
+
+        self.cleanup_duplicate_items()
+
 
     def create_collection(self, name: str, collection_type: str, civitai_id: Optional[int] = None) -> int:
         with self.connect() as conn:
@@ -206,6 +251,35 @@ class CollectionDatabase:
             rows = conn.execute(query, (collection_id,)).fetchall()
         return [dict(row) for row in rows]
 
+    def get_collection_item_ids(self, collection_id: int) -> set[int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT item_id FROM collection_items WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchall()
+
+        return {int(row["item_id"]) for row in rows}
+
+    def cleanup_orphan_items(self) -> int:
+        with self.connect() as conn:
+            orphan_rows = conn.execute(
+                """
+                SELECT i.id
+                FROM items i
+                LEFT JOIN collection_items ci ON ci.item_id = i.id
+                WHERE ci.item_id IS NULL
+                """
+            ).fetchall()
+
+            orphan_ids = [int(row["id"]) for row in orphan_rows]
+
+            for item_id in orphan_ids:
+                conn.execute("DELETE FROM resources WHERE item_id = ?", (item_id,))
+                conn.execute("DELETE FROM generation_params WHERE item_id = ?", (item_id,))
+                conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+
+        return len(orphan_ids)
+
     def get_item_detail(self, item_id: int) -> Optional[Dict[str, Any]]:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
@@ -220,6 +294,48 @@ class CollectionDatabase:
                 ).fetchall()
             ]
             return detail
+
+    def get_item_by_civitai_image_id(self, image_id: int) -> Optional[Dict[str, Any]]:
+        if image_id is None:
+            return None
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM items
+                WHERE civitai_image_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (image_id,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def item_has_resources(self, item_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM resources WHERE item_id = ?",
+                (item_id,),
+            ).fetchone()
+
+        return bool(row and int(row["n"]) > 0)
+
+    def item_has_generation_params(self, item_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM generation_params WHERE item_id = ?",
+                (item_id,),
+            ).fetchone()
+
+        return bool(row and int(row["n"]) > 0)
+
+    def item_is_hydrated(self, item_id: int) -> bool:
+        # For incremental sync, "hydrated" must mean resource data exists.
+        # Generation params alone are not enough because the detail panel depends
+        # on stored checkpoint / LoRA / embedding resources for local availability dots.
+        return self.item_has_resources(item_id)
 
     def set_setting(self, key: str, value: str) -> None:
         with self.connect() as conn:
@@ -251,6 +367,201 @@ class CollectionDatabase:
         for row in rows:
             settings[row["key"]] = row["value"]
         return settings
+
+    def get_civitai_hash_cache(self, file_hash: str) -> Optional[Dict[str, Any]]:
+        clean_hash = str(file_hash or "").strip().lower()
+        if not clean_hash:
+            return None
+
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM civitai_hash_cache
+                WHERE file_hash = ?
+                   OR hash_sha256 = ?
+                   OR hash_autov2 = ?
+                LIMIT 1
+                """,
+                (clean_hash, clean_hash, clean_hash),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def upsert_civitai_hash_cache(
+        self,
+        file_hash: str,
+        model_id: str = "",
+        version_id: str = "",
+        hash_sha256: str = "",
+        hash_autov2: str = "",
+        raw_json: str = "",
+    ) -> None:
+        clean_hash = str(file_hash or "").strip().lower()
+        if not clean_hash:
+            return
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO civitai_hash_cache (
+                    file_hash, model_id, version_id, hash_sha256, hash_autov2, raw_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_hash) DO UPDATE SET
+                    model_id = excluded.model_id,
+                    version_id = excluded.version_id,
+                    hash_sha256 = excluded.hash_sha256,
+                    hash_autov2 = excluded.hash_autov2,
+                    raw_json = excluded.raw_json,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    clean_hash,
+                    str(model_id or ""),
+                    str(version_id or ""),
+                    str(hash_sha256 or "").lower(),
+                    str(hash_autov2 or "").lower(),
+                    raw_json or "",
+                ),
+            )
+
+    def get_local_resource_file(self, file_path: str) -> Optional[Dict[str, Any]]:
+        clean_path = str(file_path or "").strip()
+        if not clean_path:
+            return None
+
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM local_resource_files WHERE file_path = ?",
+                (clean_path,),
+            ).fetchone()
+
+        return dict(row) if row else None
+
+    def upsert_local_resource_file(
+        self,
+        file_path: str,
+        resource_type: str,
+        file_size: int,
+        modified_at: float,
+        hash_sha256: str = "",
+        hash_autov2: str = "",
+        model_id: str = "",
+        version_id: str = "",
+    ) -> None:
+        clean_path = str(file_path or "").strip()
+        if not clean_path:
+            return
+
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO local_resource_files (
+                    file_path, resource_type, file_size, modified_at,
+                    hash_sha256, hash_autov2, model_id, version_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(file_path) DO UPDATE SET
+                    resource_type = excluded.resource_type,
+                    file_size = excluded.file_size,
+                    modified_at = excluded.modified_at,
+                    hash_sha256 = excluded.hash_sha256,
+                    hash_autov2 = excluded.hash_autov2,
+                    model_id = excluded.model_id,
+                    version_id = excluded.version_id,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    clean_path,
+                    str(resource_type or ""),
+                    int(file_size or 0),
+                    float(modified_at or 0.0),
+                    str(hash_sha256 or "").lower(),
+                    str(hash_autov2 or "").lower(),
+                    str(model_id or ""),
+                    str(version_id or ""),
+                ),
+            )
+
+    def cleanup_duplicate_items(self) -> None:
+        with self.connect() as conn:
+            duplicate_rows = conn.execute(
+                """
+                SELECT civitai_image_id
+                FROM items
+                WHERE civitai_image_id IS NOT NULL
+                GROUP BY civitai_image_id
+                HAVING COUNT(*) > 1
+                """
+            ).fetchall()
+
+            for row in duplicate_rows:
+                image_id = row["civitai_image_id"]
+
+                ranked_rows = conn.execute(
+                    """
+                    SELECT
+                        i.id,
+                        (SELECT COUNT(*) FROM resources r WHERE r.item_id = i.id) AS resource_count,
+                        (SELECT COUNT(*) FROM generation_params gp WHERE gp.item_id = i.id) AS param_count,
+                        (SELECT COUNT(*) FROM collection_items ci WHERE ci.item_id = i.id) AS collection_count
+                    FROM items i
+                    WHERE i.civitai_image_id = ?
+                    ORDER BY resource_count DESC, param_count DESC, collection_count DESC, id ASC
+                    """,
+                    (image_id,),
+                ).fetchall()
+
+                if not ranked_rows:
+                    continue
+
+                keep_id = int(ranked_rows[0]["id"])
+                duplicate_ids = [int(r["id"]) for r in ranked_rows[1:]]
+
+                for duplicate_id in duplicate_ids:
+                    duplicate_links = conn.execute(
+                        """
+                        SELECT collection_id, order_index
+                        FROM collection_items
+                        WHERE item_id = ?
+                        """,
+                        (duplicate_id,),
+                    ).fetchall()
+
+                    for link in duplicate_links:
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO collection_items (collection_id, item_id, order_index)
+                            VALUES (?, ?, ?)
+                            """,
+                            (link["collection_id"], keep_id, link["order_index"]),
+                        )
+
+                    conn.execute("DELETE FROM collection_items WHERE item_id = ?", (duplicate_id,))
+                    conn.execute("DELETE FROM resources WHERE item_id = ?", (duplicate_id,))
+                    conn.execute("DELETE FROM generation_params WHERE item_id = ?", (duplicate_id,))
+                    conn.execute("DELETE FROM items WHERE id = ?", (duplicate_id,))
+
+            conn.execute(
+                """
+                DELETE FROM resources
+                WHERE item_id NOT IN (SELECT id FROM items)
+                """
+            )
+
+            conn.execute(
+                """
+                DELETE FROM generation_params
+                WHERE item_id NOT IN (SELECT id FROM items)
+                """
+            )
+
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_items_civitai_image_id_unique
+                ON items(civitai_image_id)
+                WHERE civitai_image_id IS NOT NULL
+                """
+            )
 
     def get_or_create_collection(
         self,
@@ -339,6 +650,22 @@ class CollectionDatabase:
         vae_name: str = "",
     ) -> int:
         with self.connect() as conn:
+
+            # 🔴 Prevent duplicate inserts at source
+            if civitai_image_id is not None:
+                existing = conn.execute(
+                    """
+                    SELECT id
+                    FROM items
+                    WHERE civitai_image_id = ?
+                    LIMIT 1
+                    """,
+                    (civitai_image_id,),
+                ).fetchone()
+
+                if existing:
+                    return int(existing["id"])
+
             cur = conn.execute(
                 """
                 INSERT INTO items (
@@ -419,6 +746,8 @@ class CollectionDatabase:
         weight: float = 1.0,
         model_id: Optional[int] = None,
         version_id: Optional[int] = None,
+        hash_sha256: str = "",
+        hash_autov2: str = "",
         local_status: str = "red",
         local_filename: Optional[str] = None,
     ) -> None:
@@ -426,8 +755,9 @@ class CollectionDatabase:
             conn.execute(
                 """
                 INSERT INTO resources (
-                    item_id, resource_type, name, version_name, weight, model_id, version_id, local_status, local_filename
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    item_id, resource_type, name, version_name, weight, model_id, version_id,
+                    hash_sha256, hash_autov2, local_status, local_filename
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
@@ -437,6 +767,8 @@ class CollectionDatabase:
                     weight,
                     model_id,
                     version_id,
+                    hash_sha256,
+                    hash_autov2,
                     local_status,
                     local_filename,
                 ),

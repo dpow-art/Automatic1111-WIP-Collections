@@ -23,14 +23,48 @@ DATA_DIR = EXTENSION_ROOT / "data"
 DEFAULT_DB_PATH = DATA_DIR / "collections.db"
 DEFAULT_IMAGE_CACHE_DIR = DATA_DIR / "images"
 INITIAL_BATCH_SIZE = 35
+
 NSFW_ON_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "nsfw_on.svg"
 NSFW_ON_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
     NSFW_ON_ICON_PATH.read_bytes()
 ).decode("ascii")
 
+MAIN_VIEW_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "main_view.svg"
+MAIN_VIEW_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    MAIN_VIEW_ICON_PATH.read_bytes()
+).decode("ascii")
+
+SCROLL_VIEW_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "scroll_view.svg"
+SCROLL_VIEW_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    SCROLL_VIEW_ICON_PATH.read_bytes()
+).decode("ascii")
+
+DETAIL_VIEW_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "detail_view.svg"
+DETAIL_VIEW_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    DETAIL_VIEW_ICON_PATH.read_bytes()
+).decode("ascii")
+
+PLAY_PAUSE_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "Play_pause.svg"
+PLAY_PAUSE_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    PLAY_PAUSE_ICON_PATH.read_bytes()
+).decode("ascii")
+
+THUMB_SCALE_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "thumb_scale.svg"
+THUMB_SCALE_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    THUMB_SCALE_ICON_PATH.read_bytes()
+).decode("ascii")
+
 _db: Optional[CollectionDatabase] = None
 _hide_nsfw: bool = False
 _stop_requested: bool = False
+_current_view: str = "grid"
+_active_collection_id: Optional[int] = None
+_selected_item_id: Optional[int] = None
+_video_autoplay_enabled: bool = True
+_local_resource_index_cache: Dict[str, Any] = {}
+_model_version_hash_cache: Dict[str, Dict[str, str]] = {}
+_preview_size: int = 128
+PREVIEW_SIZE_MAX = 400
 
 DETAIL_REQUEST_DELAY_SECONDS = 1.25
 DETAIL_REQUEST_FAILURE_BACKOFF_SECONDS = 8.0
@@ -153,6 +187,21 @@ def _to_browser_src(path_or_url: str) -> str:
 
     local_path = Path(path_or_url).resolve()
     return f"/file={quote(str(local_path))}"
+
+
+def _civitai_web_base_url() -> str:
+    source_mode = _settings()["source_mode"]
+    if source_mode == "sfw":
+        return "https://civitai.com"
+    return "https://civitai.red"
+
+
+def _civitai_page_url(path: str) -> str:
+    clean_path = (path or "").strip()
+    if not clean_path.startswith("/"):
+        clean_path = f"/{clean_path}"
+    return f"{_civitai_web_base_url()}{clean_path}"
+
 
 def _slugify_collection_name(name: str) -> str:
     value = (name or "").strip().lower()
@@ -430,91 +479,28 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
 
 
 def _render_controls_bar() -> str:
-    global _hide_nsfw
+    global _hide_nsfw, _current_view, _preview_size, _video_autoplay_enabled
+
+    view_label = {
+        "grid": "Grid",
+        "scroll": "Scrolling",
+        "detail": "Detailed",
+    }.get(_current_view, "Grid")
+
+    video_label = "Videos: Play" if _video_autoplay_enabled else "Videos: Pause"
 
     return f"""
     <div style="
-        position:sticky;
-        top:0;
-        z-index:20;
-        background:#111;
-        border-bottom:1px solid #202020;
-        padding:8px 12px;
+        padding:4px 12px 8px 12px;
+        color:#777;
+        font-size:12px;
         display:flex;
-        align-items:center;
         justify-content:flex-end;
-        gap:8px;
+        gap:12px;
     ">
-        <div style="
-            display:flex;
-            align-items:center;
-            gap:8px;
-            color:#666;
-            font-size:12px;
-        ">
-            <div title="Thumbnail scale" style="
-                width:18px;
-                height:18px;
-                border:1px solid #333;
-                border-radius:4px;
-                position:relative;
-                opacity:0.75;
-            ">
-                <div style="
-                    position:absolute;
-                    left:3px;
-                    top:3px;
-                    width:6px;
-                    height:10px;
-                    border:1px solid #555;
-                    border-radius:2px;
-                "></div>
-            </div>
-
-            <div title="Regular view" style="
-                width:18px;
-                height:18px;
-                border:1px solid #333;
-                border-radius:4px;
-                display:grid;
-                grid-template-columns:1fr 1fr;
-                gap:2px;
-                padding:2px;
-                box-sizing:border-box;
-                opacity:0.75;
-            ">
-                <div style="background:#444;border-radius:1px;"></div>
-                <div style="background:#444;border-radius:1px;"></div>
-                <div style="background:#444;border-radius:1px;"></div>
-                <div style="background:#444;border-radius:1px;"></div>
-            </div>
-
-            <div title="Scroll view" style="
-                width:18px;
-                height:18px;
-                border:1px solid #333;
-                border-radius:4px;
-                display:flex;
-                align-items:center;
-                justify-content:center;
-                opacity:0.75;
-                color:#666;
-                font-size:12px;
-            ">↕</div>
-
-            <div title="Focused view" style="
-                width:18px;
-                height:18px;
-                border:1px solid #333;
-                border-radius:4px;
-                display:flex;
-                align-items:center;
-                justify-content:center;
-                opacity:0.75;
-                color:#666;
-                font-size:12px;
-            ">▥</div>
-        </div>
+        <span>View: {html.escape(view_label)}</span>
+        <span>Preview: {int(_preview_size)}px</span>
+        <span>{html.escape(video_label)}</span>
     </div>
     """
 
@@ -545,7 +531,11 @@ def _get_filtered_items_for_collection(collection_id: int) -> List[Dict[str, Any
 
 
 def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
+    global _video_autoplay_enabled
+
     cards: List[str] = []
+    video_autoplay_attr = "autoplay" if _video_autoplay_enabled else ""
+
     for item in items:
         preview_source = item.get("preview_path") or item.get("image_url") or ""
         browser_src = _to_browser_src(preview_source)
@@ -556,9 +546,24 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
         is_mp4 = _item_is_video(item)
 
         thumb_html = ""
+        item_id = int(item["id"])
+
         if image_url and not is_mp4:
             thumb_html = f"""
-            <div class="collection-card" style="
+            <button
+                id="collection_card_{item_id}"
+                data-item-id="{item_id}"
+                type="button"
+                class="collection-card"
+                onclick="(function() {{
+                    const root = gradioApp();
+                    const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+                    if (!selectedEl) return;
+                    selectedEl.value = '{item_id}';
+                    selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }})()"
+                style="
                 background:#171717;
                 border:1px solid #272727;
                 border-radius:14px;
@@ -585,11 +590,24 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
                         "
                     />
                 </div>
-            </div>
+            </button>
             """
         elif is_mp4:
             thumb_html = f"""
-            <div class="collection-card" style="
+            <button
+                id="collection_card_{item_id}"
+                data-item-id="{item_id}"
+                type="button"
+                class="collection-card"
+                onclick="(function() {{
+                    const root = gradioApp();
+                    const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+                    if (!selectedEl) return;
+                    selectedEl.value = '{item_id}';
+                    selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                }})()"
+                style="
                 background:#171717;
                 border:1px solid #272727;
                 border-radius:14px;
@@ -607,7 +625,7 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
                     <video 
                         class="collection-preview-video"
                         src="{image_url}"
-                        autoplay
+                        {video_autoplay_attr}
                         loop
                         muted
                         playsinline
@@ -621,7 +639,7 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
                         "
                     ></video>
                 </div>
-            </div>
+            </button>
             """
         else:
             thumb_html = f"""
@@ -640,6 +658,860 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
     return "".join(cards)
 
 
+def _webui_root() -> Path:
+    return EXTENSION_ROOT.parent.parent
+
+
+import hashlib
+
+
+def _read_file_sha256(file_path: Path) -> Optional[str]:
+    try:
+        sha256 = hashlib.sha256()
+        with file_path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except Exception:
+        return None
+
+
+def _read_local_sidecar_json(model_path: Path) -> Dict[str, Any]:
+    sidecar_candidates = [
+        model_path.with_suffix(model_path.suffix + ".json"),
+        model_path.with_suffix(".json"),
+        model_path.with_suffix(".civitai.info"),
+        model_path.with_name(model_path.name + ".json"),
+        model_path.with_name(model_path.name + ".civitai.info"),
+    ]
+
+    for sidecar_path in sidecar_candidates:
+        if not sidecar_path.exists() or not sidecar_path.is_file():
+            continue
+
+        try:
+            return json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+    return {}
+
+
+def _extract_sidecar_hashes(sidecar: Dict[str, Any]) -> Dict[str, str]:
+    hashes = sidecar.get("hashes") or {}
+    files = sidecar.get("files") or []
+
+    sha256 = ""
+    autov2 = ""
+
+    if isinstance(hashes, dict):
+        sha256 = str(hashes.get("SHA256") or hashes.get("sha256") or "").strip().lower()
+        autov2 = str(hashes.get("AutoV2") or hashes.get("autov2") or "").strip().lower()
+
+    if not sha256:
+        sha256 = str(sidecar.get("sha256") or sidecar.get("SHA256") or "").strip().lower()
+
+    if not autov2:
+        autov2 = str(sidecar.get("AutoV2") or sidecar.get("autov2") or sidecar.get("modelHash") or "").strip().lower()
+
+    if (not sha256 or not autov2) and isinstance(files, list):
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                continue
+
+            file_hashes = file_info.get("hashes") or {}
+            if not isinstance(file_hashes, dict):
+                continue
+
+            if not sha256:
+                sha256 = str(file_hashes.get("SHA256") or file_hashes.get("sha256") or "").strip().lower()
+
+            if not autov2:
+                autov2 = str(file_hashes.get("AutoV2") or file_hashes.get("autov2") or "").strip().lower()
+
+    return {
+        "sha256": sha256,
+        "autov2": autov2,
+    }
+
+
+def _identity_from_local_resource_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    model_ids = set()
+    version_ids = set()
+    hashes = set()
+
+    if not row:
+        return {
+            "model_ids": model_ids,
+            "version_ids": version_ids,
+            "hashes": hashes,
+        }
+
+    model_id = str(row.get("model_id") or "").strip()
+    version_id = str(row.get("version_id") or "").strip()
+    hash_sha256 = str(row.get("hash_sha256") or "").strip().lower()
+    hash_autov2 = str(row.get("hash_autov2") or "").strip().lower()
+
+    if model_id:
+        model_ids.add(model_id)
+    if version_id:
+        version_ids.add(version_id)
+    if hash_sha256:
+        hashes.add(hash_sha256)
+        hashes.add(hash_sha256[:10])
+    if hash_autov2:
+        hashes.add(hash_autov2)
+
+    return {
+        "model_ids": model_ids,
+        "version_ids": version_ids,
+        "hashes": hashes,
+    }
+
+
+def _identity_from_hash_cache_row(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    model_ids = set()
+    version_ids = set()
+    hashes = set()
+
+    if not row:
+        return {
+            "model_ids": model_ids,
+            "version_ids": version_ids,
+            "hashes": hashes,
+        }
+
+    model_id = str(row.get("model_id") or "").strip()
+    version_id = str(row.get("version_id") or "").strip()
+    hash_sha256 = str(row.get("hash_sha256") or "").strip().lower()
+    hash_autov2 = str(row.get("hash_autov2") or "").strip().lower()
+
+    if model_id:
+        model_ids.add(model_id)
+    if version_id:
+        version_ids.add(version_id)
+    if hash_sha256:
+        hashes.add(hash_sha256)
+        hashes.add(hash_sha256[:10])
+    if hash_autov2:
+        hashes.add(hash_autov2)
+
+    return {
+        "model_ids": model_ids,
+        "version_ids": version_ids,
+        "hashes": hashes,
+    }
+
+
+def _first_set_value(values: set[str]) -> str:
+    for value in values:
+        if value:
+            return str(value)
+    return ""
+
+
+def _extract_civitai_version_identity(payload: Dict[str, Any]) -> Dict[str, Any]:
+    model_ids = set()
+    version_ids = set()
+    hashes = set()
+
+    if not isinstance(payload, dict):
+        return {
+            "model_ids": model_ids,
+            "version_ids": version_ids,
+            "hashes": hashes,
+        }
+
+    version_id = payload.get("id") or payload.get("modelVersionId")
+    model_id = payload.get("modelId")
+
+    if version_id is not None and str(version_id).strip():
+        version_ids.add(str(version_id).strip())
+
+    if model_id is not None and str(model_id).strip():
+        model_ids.add(str(model_id).strip())
+
+    model_payload = payload.get("model")
+    if isinstance(model_payload, dict):
+        nested_model_id = model_payload.get("id") or model_payload.get("modelId")
+        if nested_model_id is not None and str(nested_model_id).strip():
+            model_ids.add(str(nested_model_id).strip())
+
+    for file_info in payload.get("files", []) or []:
+        if not isinstance(file_info, dict):
+            continue
+
+        file_hashes = file_info.get("hashes") or {}
+        if not isinstance(file_hashes, dict):
+            continue
+
+        sha256 = str(file_hashes.get("SHA256") or file_hashes.get("sha256") or "").strip().lower()
+        autov2 = str(file_hashes.get("AutoV2") or file_hashes.get("autov2") or "").strip().lower()
+
+        if sha256:
+            hashes.add(sha256)
+            hashes.add(sha256[:10])
+
+        if autov2:
+            hashes.add(autov2)
+
+    return {
+        "model_ids": model_ids,
+        "version_ids": version_ids,
+        "hashes": hashes,
+    }
+
+
+def _extract_sidecar_ids(sidecar: Dict[str, Any]) -> tuple[set[str], set[str]]:
+    model_ids = set()
+    version_ids = set()
+
+    possible_model_keys = [
+        "modelId",
+        "model_id",
+        "id",
+    ]
+
+    possible_version_keys = [
+        "modelVersionId",
+        "model_version_id",
+        "versionId",
+        "version_id",
+    ]
+
+    for key in possible_model_keys:
+        value = sidecar.get(key)
+        if value is not None and str(value).strip():
+            model_ids.add(str(value).strip())
+
+    for key in possible_version_keys:
+        value = sidecar.get(key)
+        if value is not None and str(value).strip():
+            version_ids.add(str(value).strip())
+
+    model = sidecar.get("model")
+    if isinstance(model, dict):
+        value = model.get("id") or model.get("modelId")
+        if value is not None and str(value).strip():
+            model_ids.add(str(value).strip())
+
+    version = sidecar.get("modelVersion")
+    if isinstance(version, dict):
+        value = version.get("id") or version.get("modelVersionId")
+        if value is not None and str(value).strip():
+            version_ids.add(str(value).strip())
+
+    return model_ids, version_ids
+
+
+def _resource_search_dirs() -> Dict[str, Path]:
+    webui_root = _webui_root()
+
+    lora_dir = Path(
+        getattr(shared.cmd_opts, "lora_dir", "") or webui_root / "models" / "Lora"
+    )
+
+    embedding_dir = Path(
+        getattr(shared.cmd_opts, "embeddings_dir", "") or webui_root / "embeddings"
+    )
+
+    checkpoint_dir = Path(
+        getattr(shared.cmd_opts, "ckpt_dir", "") or webui_root / "models" / "Stable-diffusion"
+    )
+
+    return {
+        "lora": lora_dir,
+        "embedding": embedding_dir,
+        "checkpoint": checkpoint_dir,
+    }
+
+
+def _normalize_resource_lookup_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _build_local_resource_index(
+    include_hashes: bool = False,
+    force_refresh: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    global _local_resource_index_cache
+
+    now = time.time()
+    cached_at = float(_local_resource_index_cache.get("cached_at", 0) or 0)
+    cached_index = _local_resource_index_cache.get("index")
+    cached_has_hashes = bool(_local_resource_index_cache.get("has_hashes", False))
+
+    if cached_index and not force_refresh:
+        if cached_has_hashes:
+            return cached_index
+        if not include_hashes and now - cached_at < 60:
+            return cached_index
+
+    index = {
+        "lora": {"model_ids": set(), "version_ids": set(), "hashes": set(), "files": set()},
+        "embedding": {"model_ids": set(), "version_ids": set(), "hashes": set(), "files": set()},
+        "checkpoint": {"model_ids": set(), "version_ids": set(), "hashes": set(), "files": set()},
+    }
+
+    suffixes = {
+        "lora": {".safetensors"},
+        "embedding": {".pt", ".safetensors"},
+        "checkpoint": {".safetensors", ".ckpt"},
+    }
+
+    client = None
+    if include_hashes:
+        settings = _settings()
+        client = CivitaiClient(
+            api_key=settings["api_key"] or None,
+            source_mode=settings["source_mode"],
+        )
+
+    by_hash_cache: Dict[str, Dict[str, Any]] = {}
+
+    for resource_type, root_dir in _resource_search_dirs().items():
+        if not root_dir.exists():
+            continue
+
+        for path in root_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() not in suffixes.get(resource_type, set()):
+                continue
+
+            index[resource_type]["files"].add(path.as_posix())
+
+            sidecar = _read_local_sidecar_json(path)
+            if sidecar:
+                model_ids, version_ids = _extract_sidecar_ids(sidecar)
+                index[resource_type]["model_ids"].update(model_ids)
+                index[resource_type]["version_ids"].update(version_ids)
+
+            if include_hashes and path.suffix.lower() in {".safetensors", ".ckpt", ".pt"}:
+                db = _get_db()
+
+                try:
+                    stat = path.stat()
+                    file_size = int(stat.st_size)
+                    modified_at = float(stat.st_mtime)
+                except Exception:
+                    continue
+
+                file_path_key = path.as_posix()
+                local_cached_row = db.get_local_resource_file(file_path_key)
+
+                if (
+                    local_cached_row
+                    and str(local_cached_row.get("resource_type") or "") == resource_type
+                    and int(local_cached_row.get("file_size") or 0) == file_size
+                    and float(local_cached_row.get("modified_at") or 0.0) == modified_at
+                ):
+                    identity = _identity_from_local_resource_row(local_cached_row)
+                    index[resource_type]["model_ids"].update(identity["model_ids"])
+                    index[resource_type]["version_ids"].update(identity["version_ids"])
+                    index[resource_type]["hashes"].update(identity["hashes"])
+                    continue
+
+                sidecar_hashes = _extract_sidecar_hashes(sidecar) if sidecar else {}
+
+                normalized_hash = sidecar_hashes.get("sha256", "")
+                short_hash = sidecar_hashes.get("autov2", "")
+
+                filename_hash_match = re.search(r"\[([0-9a-f]{8,})\]", path.name.lower())
+                if not short_hash and filename_hash_match:
+                    short_hash = filename_hash_match.group(1).lower()
+
+                if not normalized_hash and not short_hash:
+                    file_hash = _read_file_sha256(path)
+                    if not file_hash:
+                        continue
+
+                    normalized_hash = file_hash.lower()
+                    short_hash = normalized_hash[:10]
+
+                if normalized_hash:
+                    index[resource_type]["hashes"].add(normalized_hash)
+                    index[resource_type]["hashes"].add(normalized_hash[:10])
+
+                if short_hash:
+                    index[resource_type]["hashes"].add(short_hash)
+
+                lookup_hash = normalized_hash or short_hash
+                cached_row = db.get_civitai_hash_cache(lookup_hash)
+
+                if cached_row:
+                    identity = _identity_from_hash_cache_row(cached_row)
+                elif normalized_hash or short_hash:
+                    # Fast offline fallback: if we know the local hash but have not
+                    # enriched it with Civitai identity yet, still cache the local file
+                    # and avoid hammering Civitai during normal availability scans.
+                    identity = {
+                        "model_ids": set(),
+                        "version_ids": set(),
+                        "hashes": {h for h in {normalized_hash, short_hash} if h},
+                    }
+                else:
+                    if lookup_hash in by_hash_cache:
+                        version_payload = by_hash_cache[lookup_hash]
+                    elif client is not None:
+                        version_payload = client.get_model_version_by_hash(lookup_hash)
+                        by_hash_cache[lookup_hash] = version_payload
+                        time.sleep(0.2)
+                    else:
+                        version_payload = {}
+
+                    identity = _extract_civitai_version_identity(version_payload)
+                    version_hashes = _extract_resource_hashes(version_payload)
+
+                    if not normalized_hash:
+                        normalized_hash = version_hashes.get("sha256", "")
+                    if not short_hash:
+                        short_hash = version_hashes.get("autov2", "") or (normalized_hash[:10] if normalized_hash else "")
+
+                    db.upsert_civitai_hash_cache(
+                        file_hash=lookup_hash,
+                        model_id=_first_set_value(identity["model_ids"]),
+                        version_id=_first_set_value(identity["version_ids"]),
+                        hash_sha256=normalized_hash,
+                        hash_autov2=short_hash,
+                        raw_json=json.dumps(version_payload),
+                    )
+
+                db.upsert_local_resource_file(
+                    file_path=file_path_key,
+                    resource_type=resource_type,
+                    file_size=file_size,
+                    modified_at=modified_at,
+                    hash_sha256=normalized_hash,
+                    hash_autov2=short_hash,
+                    model_id=_first_set_value(identity["model_ids"]),
+                    version_id=_first_set_value(identity["version_ids"]),
+                )
+
+                index[resource_type]["model_ids"].update(identity["model_ids"])
+                index[resource_type]["version_ids"].update(identity["version_ids"])
+                index[resource_type]["hashes"].update(identity["hashes"])
+
+    _local_resource_index_cache = {
+        "cached_at": now,
+        "has_hashes": include_hashes,
+        "index": index,
+    }
+
+    return index
+
+
+def _render_local_status_dot(
+    resource_type: str,
+    resource_name: str,
+    model_id: Optional[Any] = None,
+    version_id: Optional[Any] = None,
+    hash_sha256: str = "",
+    hash_autov2: str = "",
+) -> str:
+    index = _build_local_resource_index(
+        include_hashes=True,
+        force_refresh=False,
+    )
+    type_index = index.get(resource_type, {})
+
+    model_id_text = str(model_id).strip() if model_id else ""
+    version_id_text = str(version_id).strip() if version_id else ""
+    hash_sha256_text = str(hash_sha256 or "").strip().lower()
+    hash_autov2_text = str(hash_autov2 or "").strip().lower()
+
+    is_local = False
+    can_verify = False
+
+    if model_id_text:
+        can_verify = True
+        if model_id_text in type_index.get("model_ids", set()):
+            is_local = True
+
+    if version_id_text:
+        can_verify = True
+        if version_id_text in type_index.get("version_ids", set()):
+            is_local = True
+
+    if hash_sha256_text:
+        can_verify = True
+        if hash_sha256_text in type_index.get("hashes", set()):
+            is_local = True
+
+    if hash_autov2_text:
+        can_verify = True
+        if hash_autov2_text in type_index.get("hashes", set()):
+            is_local = True
+
+    color = "#36d66b" if is_local else "#e04444"
+    title = "Verified local file present" if is_local else "Verified missing locally"
+
+    if not can_verify:
+        color = "#8a8a8a"
+        title = "Unable to verify: no Civitai hash or version ID available"
+
+    return f"""
+    <span
+        title="{html.escape(title)}"
+        style="
+            display:inline-block;
+            width:8px;
+            height:8px;
+            border-radius:999px;
+            background:{color};
+            margin-right:6px;
+            vertical-align:middle;
+        "
+    ></span>
+    """
+
+
+def _find_detail_item(collection_id: int) -> Optional[Dict[str, Any]]:
+    global _selected_item_id
+
+    items = _get_filtered_items_for_collection(collection_id)
+    if not items:
+        return None
+
+    if _selected_item_id is not None:
+        for item in items:
+            try:
+                if int(item["id"]) == int(_selected_item_id):
+                    return item
+            except Exception:
+                pass
+
+    _selected_item_id = int(items[0]["id"])
+    return items[0]
+
+
+def _render_resources_block(item: Dict[str, Any]) -> str:
+    db = _get_db()
+    detail = db.get_item_detail(int(item["id"])) or {}
+    resources = detail.get("resources") or []
+
+    checkpoint_html = ""
+    lora_rows = []
+    embedding_rows = []
+
+    for r in resources:
+        name_raw = r.get("name") or "Unknown"
+        name = html.escape(name_raw)
+        version = html.escape(r.get("version_name") or "")
+        weight = r.get("weight")
+        resource_type = (r.get("resource_type") or "").lower()
+
+        model_id = r.get("model_id")
+        version_id = r.get("version_id")
+        hash_sha256 = r.get("hash_sha256") or ""
+        hash_autov2 = r.get("hash_autov2") or ""
+        local_dot = _render_local_status_dot(
+            resource_type,
+            name_raw,
+            model_id,
+            version_id,
+            hash_sha256,
+            hash_autov2,
+        )
+
+        url = ""
+        if model_id:
+            url = _civitai_page_url(f"/models/{model_id}")
+            if version_id:
+                url += f"?modelVersionId={version_id}"
+
+        link_html = f'<a href="{url}" target="_blank" style="color:#9fd4ff;text-decoration:none;">{name}</a>' if url else name
+
+        badge = ""
+        if resource_type == "checkpoint":
+            badge = '<span style="font-size:10px;background:#3b6ea8;padding:2px 6px;border-radius:6px;margin-left:6px;">CHECKPOINT</span>'
+            checkpoint_html = f"""
+                <div style="margin-bottom:10px;">
+                    {local_dot}{link_html} {badge}
+                    <div style="font-size:11px;color:#888;">{version}</div>
+                </div>
+            """
+        elif resource_type == "lora":
+            badge = '<span style="font-size:10px;background:#5a3ba8;padding:2px 6px;border-radius:6px;margin-left:6px;">LORA</span>'
+            weight_str = f"{float(weight):.2f}" if weight is not None else "1.0"
+
+            lora_rows.append(f"""
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                    <div>{local_dot}{link_html} {badge}</div>
+                    <div style="font-size:11px;color:#aaa;">{weight_str}</div>
+                </div>
+            """)
+        elif resource_type == "embedding":
+            badge = '<span style="font-size:10px;background:#3ba86e;padding:2px 6px;border-radius:6px;margin-left:6px;">EMBED</span>'
+
+            embedding_rows.append(f"""
+                <div style="margin-bottom:6px;">
+                    {local_dot}{link_html} {badge}
+                </div>
+            """)
+
+    lora_block = "".join(lora_rows)
+    embedding_block = "".join(embedding_rows)
+
+    return f"""
+    <div style="margin-bottom:16px;">
+        <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Resources used</div>
+
+        {checkpoint_html}
+
+        {"<div style='margin-top:10px;'>" + lora_block + "</div>" if lora_block else ""}
+
+        {"<div style='margin-top:10px;'>" + embedding_block + "</div>" if embedding_block else ""}
+    </div>
+    """
+
+
+def _render_detail_view(item: Optional[Dict[str, Any]], collection_id: int) -> str:
+    if not item:
+        return """
+        <div style="
+            height:72vh;
+            display:flex;
+            align-items:center;
+            justify-content:center;
+            color:#888;
+            background:#101010;
+            border-radius:12px;
+        ">
+            No item selected.
+        </div>
+        """
+
+    items = _get_filtered_items_for_collection(collection_id)
+    item_ids = [int(row["id"]) for row in items]
+
+    current_item_id = int(item["id"])
+    current_index = item_ids.index(current_item_id) if current_item_id in item_ids else 0
+
+    previous_item_id = item_ids[current_index - 1] if current_index > 0 else None
+    next_item_id = item_ids[current_index + 1] if current_index < len(item_ids) - 1 else None
+
+    def _nav_button(label: str, target_item_id: Optional[int], side: str) -> str:
+        if target_item_id is None:
+            return ""
+
+        return f"""
+        <button
+            type="button"
+            onclick="(function(event) {{
+                event.stopPropagation();
+                const root = gradioApp();
+                const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+                if (!selectedEl) return;
+                selectedEl.value = '{target_item_id}';
+                selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }})(event)"
+            style="
+                position:absolute;
+                {side}:14px;
+                top:50%;
+                transform:translateY(-50%);
+                width:42px;
+                height:64px;
+                border-radius:10px;
+                border:1px solid #333;
+                background:rgba(0,0,0,0.55);
+                color:#f2f2f2;
+                font-size:30px;
+                line-height:1;
+                cursor:pointer;
+                z-index:5;
+            "
+        >{label}</button>
+        """
+
+    previous_button = _nav_button("‹", previous_item_id, "left")
+    next_button = _nav_button("›", next_item_id, "right")
+
+    media_source = item.get("full_path") or item.get("preview_path") or item.get("image_url") or ""
+    media_url = html.escape(_to_browser_src(media_source))
+    title = html.escape(item.get("title") or "Untitled")
+    creator_raw = item.get("creator_name") or "Unknown"
+    creator = html.escape(creator_raw)
+    creator_url = html.escape(_civitai_page_url(f"/user/{quote(str(creator_raw))}")) if creator_raw != "Unknown" else ""
+
+    raw_post_url = item.get("post_url") or ""
+    if "/images/" in raw_post_url:
+        raw_post_url = _civitai_page_url(raw_post_url.split("/images/", 1)[1].join(["/images/", ""]))
+    post_url = html.escape(raw_post_url)
+    prompt = html.escape(item.get("prompt") or "")
+    negative_prompt = html.escape(item.get("negative_prompt") or "")
+    sampler = html.escape(str(item.get("sampler") or ""))
+    steps = html.escape(str(item.get("steps") or ""))
+    cfg_scale = html.escape(str(item.get("cfg_scale") or ""))
+    seed = html.escape(str(item.get("seed") or ""))
+    checkpoint = html.escape(item.get("checkpoint_name") or "")
+
+    if _item_is_video(item):
+        media_html = f"""
+        <video
+            src="{media_url}"
+            controls
+            autoplay
+            loop
+            muted
+            playsinline
+            onclick="event.stopPropagation();"
+            style="
+                max-width:100%;
+                max-height:72vh;
+                width:auto;
+                height:auto;
+                object-fit:contain;
+                display:block;
+            "
+        ></video>
+        """
+    else:
+        media_html = f"""
+        <img
+            src="{media_url}"
+            alt="{title}"
+            style="
+                max-width:100%;
+                max-height:72vh;
+                width:auto;
+                height:auto;
+                object-fit:contain;
+                display:block;
+            "
+        />
+        """
+
+    return f"""
+    <div
+        tabindex="0"
+        onmouseenter="this.focus()"
+        onkeydown="(function(event) {{
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            event.preventDefault();
+
+            const targetId = event.key === 'ArrowLeft'
+                ? '{previous_item_id or ''}'
+                : '{next_item_id or ''}';
+
+            if (!targetId) return;
+
+            const root = gradioApp();
+            const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+            if (!selectedEl) return;
+
+            selectedEl.value = targetId;
+            selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }})(event)"
+        style="
+            min-height:72vh;
+            display:grid;
+            grid-template-columns:minmax(0, 1fr) 360px;
+            gap:14px;
+            background:#101010;
+            border-radius:12px;
+            padding:12px;
+            box-sizing:border-box;
+            outline:none;
+        "
+    >
+        <div
+            title="Click image to return to scrolling view"
+            onclick="(function() {{
+                const root = gradioApp();
+                const actionEl = root.querySelector('#collection_detail_action textarea, #collection_detail_action input');
+                if (!actionEl) return;
+                actionEl.value = 'return_scroll:' + Date.now();
+                actionEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                actionEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }})()"
+            style="
+                position:relative;
+                min-width:0;
+                height:72vh;
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                background:#0b0b0b;
+                border-radius:10px;
+                overflow:hidden;
+                cursor:pointer;
+            "
+        >
+            {previous_button}
+            {media_html}
+            {next_button}
+        </div>
+
+        <div style="
+            max-height:72vh;
+            overflow:auto;
+            background:#25262b;
+            border-radius:12px;
+            padding:16px;
+            box-sizing:border-box;
+            color:#d8d8d8;
+        ">
+            <div style="font-size:18px;font-weight:700;margin-bottom:4px;">
+                {f'''
+                <a
+                    href="{post_url}"
+                    target="_blank"
+                    style="
+                        color:#9fd4ff;
+                        text-decoration:none;
+                    "
+                    onmouseover="this.style.textDecoration='underline'"
+                    onmouseout="this.style.textDecoration='none'"
+                >
+                    {title}
+                </a>
+                ''' if post_url else title}
+            </div>
+
+            <div style="font-size:12px;color:#9aa0aa;margin-bottom:16px;">
+                Creator:
+                {f'''
+                <a
+                    href="{creator_url}"
+                    target="_blank"
+                    style="color:#9fd4ff;text-decoration:none;margin-left:4px;"
+                >
+                    {creator}
+                </a>
+                ''' if creator_url else creator}
+            </div>
+
+            {_render_resources_block(item)}
+
+            <div style="font-size:16px;font-weight:700;margin-bottom:8px;">Generation data</div>
+
+            <div style="font-size:13px;color:#aeb4c0;margin-bottom:10px;">
+                <strong>Checkpoint:</strong> {checkpoint or "Unknown"}<br>
+                <strong>Sampler:</strong> {sampler or "Unknown"}<br>
+                <strong>Steps:</strong> {steps or "Unknown"}<br>
+                <strong>CFG:</strong> {cfg_scale or "Unknown"}<br>
+                <strong>Seed:</strong> {seed or "Unknown"}
+            </div>
+
+            <hr style="border:0;border-top:1px solid #3a3b40;margin:14px 0;">
+
+            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Prompt</div>
+            <div style="font-size:13px;line-height:1.45;color:#b9bec9;white-space:pre-wrap;">{prompt or "No prompt found."}</div>
+
+            <hr style="border:0;border-top:1px solid #3a3b40;margin:14px 0;">
+
+            <div style="font-size:15px;font-weight:700;margin-bottom:6px;">Negative prompt</div>
+            <div style="font-size:13px;line-height:1.45;color:#b9bec9;white-space:pre-wrap;">{negative_prompt or "No negative prompt found."}</div>
+        </div>
+
+    </div>
+    """
+
+
 def _render_feed_batch(collection_id: int, offset: int, limit: int = INITIAL_BATCH_SIZE) -> tuple[str, int, bool]:
     items = _get_filtered_items_for_collection(collection_id)
     batch_items = items[offset:offset + limit]
@@ -650,6 +1522,11 @@ def _render_feed_batch(collection_id: int, offset: int, limit: int = INITIAL_BAT
 
 
 def _render_feed_html(collection_id: Optional[int]) -> str:
+    global _current_view, _preview_size, _selected_item_id
+
+    if _current_view == "detail" and collection_id:
+        return _render_detail_view(_find_detail_item(collection_id), collection_id)
+
     if not collection_id:
         return """
         <div style="
@@ -688,9 +1565,20 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
         </div>
         """
 
+    initial_offset = 0
+
+    if _current_view == "scroll" and _selected_item_id is not None:
+        for index, item in enumerate(items):
+            try:
+                if int(item["id"]) == int(_selected_item_id):
+                    initial_offset = max(0, index - 4)
+                    break
+            except Exception:
+                pass
+
     cards_html, next_offset, has_more = _render_feed_batch(
         collection_id=collection_id,
-        offset=0,
+        offset=initial_offset,
         limit=INITIAL_BATCH_SIZE,
     )
 
@@ -713,7 +1601,7 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
             class="collection-cards collection-view-grid"
             style="
                 display:grid;
-                grid-template-columns:repeat(4, minmax(0, 1fr));
+                grid-template-columns:repeat(auto-fill, minmax({int(_preview_size)}px, 1fr));
                 gap:12px;
                 align-items:start;
             "
@@ -741,6 +1629,8 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
 
 
 def _load_collection_feed(selected_collection_id_raw: str) -> tuple[str, str]:
+    global _active_collection_id
+
     selected_collection_id: Optional[int] = None
 
     try:
@@ -748,6 +1638,8 @@ def _load_collection_feed(selected_collection_id_raw: str) -> tuple[str, str]:
             selected_collection_id = int(str(selected_collection_id_raw).strip())
     except Exception:
         selected_collection_id = None
+
+    _active_collection_id = selected_collection_id
 
     return (
         _refresh_sidebar_payload(selected_collection_id),
@@ -800,6 +1692,7 @@ def _create_local_collection(name: str) -> str:
     return _refresh_sidebar_payload()
 
 
+
 def _toggle_nsfw_filter(selected_collection_id_raw: str):
     global _hide_nsfw
     _hide_nsfw = not _hide_nsfw
@@ -817,6 +1710,232 @@ def _toggle_nsfw_filter(selected_collection_id_raw: str):
         gr.update(variant=button_variant),
         _render_controls_bar(),
         _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+    )
+
+
+def _set_collection_view(view_name: str, selected_collection_id_raw: str, selected_item_id_raw: str):
+    global _current_view, _selected_item_id, _active_collection_id
+
+    if view_name not in {"grid", "scroll", "detail"}:
+        view_name = "grid"
+
+    _current_view = view_name
+
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if selected_collection_id is None:
+        selected_collection_id = _active_collection_id
+    else:
+        _active_collection_id = selected_collection_id
+
+    if _current_view == "detail":
+        try:
+            if selected_item_id_raw and str(selected_item_id_raw).strip():
+                _selected_item_id = int(str(selected_item_id_raw).strip())
+        except Exception:
+            _selected_item_id = None
+    else:
+        _selected_item_id = None
+
+    if _current_view == "detail" and selected_collection_id and _selected_item_id is None:
+        items = _get_filtered_items_for_collection(selected_collection_id)
+        if items:
+            _selected_item_id = int(items[0]["id"])
+
+    sidebar_visible = _current_view == "grid"
+
+    return (
+        gr.update(variant="primary" if _current_view == "grid" else "secondary"),
+        gr.update(variant="primary" if _current_view == "scroll" else "secondary"),
+        gr.update(variant="primary" if _current_view == "detail" else "secondary"),
+        gr.update(visible=sidebar_visible),
+        gr.update(value=str(_selected_item_id or "")),
+        _render_controls_bar(),
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+    )
+
+def _open_selected_item_detail(selected_collection_id_raw: str, selected_item_id_raw: str):
+    global _current_view, _selected_item_id, _active_collection_id
+
+    if not selected_item_id_raw or not str(selected_item_id_raw).strip():
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            _render_controls_bar(),
+            _refresh_sidebar_payload(_active_collection_id),
+            _render_feed_html(_active_collection_id),
+        )
+
+    _current_view = "detail"
+
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if selected_collection_id is None:
+        selected_collection_id = _active_collection_id
+    else:
+        _active_collection_id = selected_collection_id
+
+    try:
+        if selected_item_id_raw and str(selected_item_id_raw).strip():
+            _selected_item_id = int(str(selected_item_id_raw).strip())
+    except Exception:
+        _selected_item_id = None
+
+    return (
+        gr.update(variant="secondary"),
+        gr.update(variant="secondary"),
+        gr.update(variant="primary"),
+        gr.update(visible=False),
+        _render_controls_bar(),
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+    )
+
+
+def _return_detail_to_scroll(selected_collection_id_raw: str, selected_item_id_raw: str, detail_action_raw: str):
+    global _current_view, _selected_item_id, _active_collection_id
+
+    # Only act on our specific command (supports timestamped values)
+    if not str(detail_action_raw or "").startswith("return_scroll"):
+        return (
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+            gr.update(),
+        )
+
+    # Switch back to scrolling view
+    _current_view = "scroll"
+
+    # Resolve collection id
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    # 🔴 Critical fix: fallback to last active collection
+    if selected_collection_id is None:
+        selected_collection_id = _active_collection_id
+    else:
+        _active_collection_id = selected_collection_id
+
+    # Preserve selected item (for scroll positioning)
+    try:
+        if selected_item_id_raw and str(selected_item_id_raw).strip():
+            _selected_item_id = int(str(selected_item_id_raw).strip())
+    except Exception:
+        pass
+
+    return (
+        gr.update(variant="secondary"),  # grid
+        gr.update(variant="primary"),    # scroll (active)
+        gr.update(variant="secondary"),  # detail
+        gr.update(visible=False),        # sidebar stays hidden in scroll
+        gr.update(value=""),             # reset selected item textbox
+        gr.update(value=""),             # reset action trigger
+        _render_controls_bar(),
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+    )
+
+
+def _set_preview_size(preview_size_raw: int, selected_collection_id_raw: str):
+    global _preview_size
+
+    try:
+        _preview_size = max(128, min(PREVIEW_SIZE_MAX, int(preview_size_raw)))
+    except Exception:
+        _preview_size = 128
+
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    return (
+        _render_controls_bar(),
+        _render_feed_html(selected_collection_id),
+    )
+
+
+def _scan_local_files_for_availability(selected_collection_id_raw: str):
+    selected_collection_id: Optional[int] = None
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    started_at = time.time()
+    index = _build_local_resource_index(
+        include_hashes=True,
+        force_refresh=True,
+    )
+    elapsed = max(0.0, time.time() - started_at)
+
+    checkpoint_files = len(index.get("checkpoint", {}).get("files", set()))
+    lora_files = len(index.get("lora", {}).get("files", set()))
+    embedding_files = len(index.get("embedding", {}).get("files", set()))
+
+    checkpoint_hashes = len(index.get("checkpoint", {}).get("hashes", set()))
+    lora_hashes = len(index.get("lora", {}).get("hashes", set()))
+    embedding_hashes = len(index.get("embedding", {}).get("hashes", set()))
+
+    status = (
+        "Local file availability scan complete.\n\n"
+        f"Checkpoint files: {checkpoint_files} | hash entries: {checkpoint_hashes}\n\n"
+        f"LoRA files: {lora_files} | hash entries: {lora_hashes}\n\n"
+        f"Embedding files: {embedding_files} | hash entries: {embedding_hashes}\n\n"
+        f"Scan time: {elapsed:.1f}s."
+    )
+
+    return (
+        _render_controls_bar(),
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+        status,
+    )
+
+
+def _toggle_video_autoplay(selected_collection_id_raw: str):
+    global _video_autoplay_enabled
+
+    _video_autoplay_enabled = not _video_autoplay_enabled
+
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    return (
+        gr.update(variant="primary" if _video_autoplay_enabled else "secondary"),
+        _render_controls_bar(),
         _render_feed_html(selected_collection_id),
     )
 
@@ -904,6 +2023,36 @@ def _safe_get(d: Dict[str, Any], *keys, default=None):
     return current
 
 
+def _to_db_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _to_db_int(value: Any) -> Optional[int]:
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list, tuple)):
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _to_db_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (dict, list, tuple)):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
 def _extract_generation_core(detail: Dict[str, Any]) -> Dict[str, Any]:
     meta = detail.get("meta") or {}
     metadata = detail.get("metadata") or {}
@@ -921,13 +2070,13 @@ def _extract_generation_core(detail: Dict[str, Any]) -> Dict[str, Any]:
     height = gen_meta.get("height") or metadata.get("height")
 
     return {
-        "steps": steps,
-        "cfg_scale": cfg_scale,
-        "sampler": sampler,
-        "seed": seed,
-        "clip_skip": clip_skip,
-        "width": width,
-        "height": height,
+        "steps": _to_db_int(steps),
+        "cfg_scale": _to_db_float(cfg_scale),
+        "sampler": _to_db_text(sampler),
+        "seed": _to_db_text(seed),
+        "clip_skip": _to_db_int(clip_skip),
+        "width": _to_db_int(width),
+        "height": _to_db_int(height),
     }
 
 def _store_generation_params(db: CollectionDatabase, item_id: int, detail: Dict[str, Any]):
@@ -943,7 +2092,7 @@ def _store_generation_params(db: CollectionDatabase, item_id: int, detail: Dict[
         db.add_generation_param(
             item_id=item_id,
             param_key=str(key),
-            param_value=str(value),
+            param_value=_to_db_text(value),
             value_type=type(value).__name__,
             display_group="core",
             source_path=f"generation.meta.{key}" if generation.get("meta") else f"meta.{key}",
@@ -1015,11 +2164,98 @@ def _extract_generation_identity(detail: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any]) -> None:
+def _extract_resource_hashes(resource: Dict[str, Any]) -> Dict[str, str]:
+    hashes = resource.get("hashes") or {}
+    files = resource.get("files") or []
+
+    sha256 = ""
+    autov2 = ""
+
+    if isinstance(hashes, dict):
+        sha256 = str(hashes.get("SHA256") or hashes.get("sha256") or "").strip()
+        autov2 = str(hashes.get("AutoV2") or hashes.get("autov2") or "").strip()
+
+    if not sha256 or not autov2:
+        for file_info in files if isinstance(files, list) else []:
+            file_hashes = file_info.get("hashes") or {}
+            if not isinstance(file_hashes, dict):
+                continue
+
+            if not sha256:
+                sha256 = str(file_hashes.get("SHA256") or file_hashes.get("sha256") or "").strip()
+
+            if not autov2:
+                autov2 = str(file_hashes.get("AutoV2") or file_hashes.get("autov2") or "").strip()
+
+    return {
+        "sha256": sha256.lower(),
+        "autov2": autov2.lower(),
+    }
+
+
+def _get_model_version_hashes(
+    client: Optional[CivitaiClient],
+    version_id: Optional[Any],
+) -> Dict[str, str]:
+    global _model_version_hash_cache
+
+    if client is None or version_id is None:
+        return {"sha256": "", "autov2": ""}
+
+    version_id_text = str(version_id).strip()
+    if not version_id_text:
+        return {"sha256": "", "autov2": ""}
+
+    if version_id_text in _model_version_hash_cache:
+        return _model_version_hash_cache[version_id_text]
+
+    version_payload = client.get_model_version(int(version_id_text))
+    version_hashes = _extract_resource_hashes(version_payload)
+
+    _model_version_hash_cache[version_id_text] = version_hashes
+
+    # Conservative request behavior.
+    time.sleep(DETAIL_REQUEST_DELAY_SECONDS)
+
+    return version_hashes
+
+
+def _fill_missing_resource_hashes(
+    client: Optional[CivitaiClient],
+    resource_hashes: Dict[str, str],
+    version_id: Optional[Any],
+) -> Dict[str, str]:
+    sha256 = resource_hashes.get("sha256", "")
+    autov2 = resource_hashes.get("autov2", "")
+
+    if sha256 and autov2:
+        return resource_hashes
+
+    version_hashes = _get_model_version_hashes(client, version_id)
+
+    return {
+        "sha256": sha256 or version_hashes.get("sha256", ""),
+        "autov2": autov2 or version_hashes.get("autov2", ""),
+    }
+
+
+def _store_resources(
+    db: CollectionDatabase,
+    item_id: int,
+    detail: Dict[str, Any],
+    client: Optional[CivitaiClient] = None,
+) -> None:
     generation = detail.get("generation") or {}
     generation_resources = generation.get("resources") or []
     gen_meta = generation.get("meta") or {}
-    meta_resources = gen_meta.get("resources") or []
+    root_meta = detail.get("meta") or {}
+
+    meta_resources = (
+        gen_meta.get("resources")
+        or root_meta.get("resources")
+        or detail.get("resources")
+        or []
+    )
 
     db.clear_resources_for_item(item_id)
 
@@ -1027,6 +2263,10 @@ def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any
         resource_type = _normalize_resource_type(resource.get("modelType"))
         name = str(resource.get("modelName") or "").strip()
         version_name = str(resource.get("versionName") or "").strip()
+        version_id = resource.get("versionId")
+        resource_hashes = _extract_resource_hashes(resource)
+        resource_hashes = _fill_missing_resource_hashes(client, resource_hashes, version_id)
+
         if not name:
             continue
 
@@ -1037,7 +2277,9 @@ def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any
             version_name=version_name,
             weight=1.0,
             model_id=resource.get("modelId"),
-            version_id=resource.get("versionId"),
+            version_id=version_id,
+            hash_sha256=resource_hashes["sha256"],
+            hash_autov2=resource_hashes["autov2"],
             local_status="red",
             local_filename=None,
         )
@@ -1050,6 +2292,9 @@ def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any
         name = str(resource.get("name") or "").strip()
         version_name = ""
         weight = _to_float(resource.get("weight"), default=1.0)
+        version_id = resource.get("versionId")
+        resource_hashes = _extract_resource_hashes(resource)
+        resource_hashes = _fill_missing_resource_hashes(client, resource_hashes, version_id)
 
         if not name:
             continue
@@ -1060,8 +2305,10 @@ def _store_resources(db: CollectionDatabase, item_id: int, detail: Dict[str, Any
             name=name,
             version_name=version_name,
             weight=weight,
-            model_id=None,
-            version_id=None,
+            model_id=resource.get("modelId"),
+            version_id=version_id,
+            hash_sha256=resource_hashes["sha256"],
+            hash_autov2=resource_hashes["autov2"],
             local_status="red",
             local_filename=None,
         )
@@ -1099,6 +2346,15 @@ def _sync_collections() -> tuple[str, str]:
         print("FETCHED COLLECTION COUNT:", len(collections))
 
         synced_count = 0
+        total_images_found = 0
+        reused_from_db = 0
+        newly_hydrated = 0
+        incomplete_rehydrated = 0
+        already_linked_before_sync = 0
+        relinked_existing_items = 0
+        new_items_created = 0
+        orphan_items_removed_before = 0
+        orphan_items_removed_after = 0
         partial_sync_detected = False
         partial_sync_reason = ""
 
@@ -1125,7 +2381,11 @@ def _sync_collections() -> tuple[str, str]:
             )
 
             images = client.get_collection_images(collection_id=int(collection_id))
-            print(f"  IMAGE COUNT: {len(images)}")
+            image_count = len(images)
+            total_images_found += image_count
+            print(f"  IMAGE COUNT: {image_count}")
+
+            pre_sync_item_ids = db.get_collection_item_ids(local_collection_id)
 
             # Only clear AFTER successful fetch
             db.clear_collection_items(local_collection_id)
@@ -1169,6 +2429,38 @@ def _sync_collections() -> tuple[str, str]:
                         )
                 else:
                     full_media_url = ""
+
+                existing_item = None
+
+                if image_id:
+                    existing_item = db.get_item_by_civitai_image_id(int(image_id))
+
+                    if not existing_item:
+                        print(f"UNMATCHED IMAGE ID: {image_id}")
+                else:
+                    print("IMAGE WITH NO ID:", image)
+
+                if existing_item:
+                    existing_item_id = int(existing_item["id"])
+                    if existing_item_id in pre_sync_item_ids:
+                        already_linked_before_sync += 1
+                    else:
+                        relinked_existing_items += 1
+
+                if existing_item and db.item_is_hydrated(int(existing_item["id"])):
+                    reused_from_db += 1
+                    db.add_item_to_collection(
+                        local_collection_id,
+                        int(existing_item["id"]),
+                        idx,
+                    )
+                    continue
+
+                if existing_item:
+                    incomplete_rehydrated += 1
+                else:
+                    newly_hydrated += 1
+                    new_items_created += 1
 
                 detail_payload: Dict[str, Any] = {}
                 generation_payload: Dict[str, Any] = {}
@@ -1223,67 +2515,90 @@ def _sync_collections() -> tuple[str, str]:
                 core = _extract_generation_core(metadata_source)
                 identity = _extract_generation_identity(metadata_source)
 
-                item_id = db.create_item(
-                    civitai_image_id=image_id,
-                    civitai_post_id=image.get("postId"),
-                    title=title,
-                    image_url=preview_url,
-                    full_media_url=full_media_url,
-                    preview_path="",
-                    full_path="",
-                    download_status="none",
-                    creator_name=detail_user.get("username") or user.get("username") or "Unknown",
-                    creator_url="",
-                    post_url=f"https://civitai.com/images/{image_id}" if image_id else "",
-                    rating=str(image.get("nsfwLevel", "Unknown")),
-                    platform="Civitai",
-                    media_type=media_type,
-                    prompt=generation_meta.get("prompt") or detail_meta.get("prompt") or meta.get("prompt") or "",
-                    negative_prompt=generation_meta.get("negativePrompt") or detail_meta.get("negativePrompt") or meta.get("negativePrompt") or "",
-                    metadata_json=json.dumps(raw_metadata_payload),
+                if existing_item:
+                    item_id = int(existing_item["id"])
+                else:
+                    item_id = db.create_item(
+                        civitai_image_id=image_id,
+                        civitai_post_id=image.get("postId"),
+                        title=title,
+                        image_url=preview_url,
+                        full_media_url=full_media_url,
+                        preview_path="",
+                        full_path="",
+                        download_status="none",
+                        creator_name=detail_user.get("username") or user.get("username") or "Unknown",
+                        creator_url="",
+                        post_url=_civitai_page_url(f"/images/{image_id}") if image_id else "",
+                        rating=str(image.get("nsfwLevel", "Unknown")),
+                        platform="Civitai",
+                        media_type=media_type,
+                        prompt=generation_meta.get("prompt") or detail_meta.get("prompt") or meta.get("prompt") or "",
+                        negative_prompt=generation_meta.get("negativePrompt") or detail_meta.get("negativePrompt") or meta.get("negativePrompt") or "",
+                        metadata_json=json.dumps(raw_metadata_payload),
 
-                    generator_name=identity["generator_name"],
-                    generator_type=identity["generator_type"],
-                    has_generation_data=identity["has_generation_data"],
-                    is_external_generator=identity["is_external_generator"],
+                        generator_name=identity["generator_name"],
+                        generator_type=identity["generator_type"],
+                        has_generation_data=identity["has_generation_data"],
+                        is_external_generator=identity["is_external_generator"],
 
-                    steps=core["steps"],
-                    cfg_scale=core["cfg_scale"],
-                    sampler=core["sampler"],
-                    seed=core["seed"],
-                    clip_skip=core["clip_skip"],
-                    width=core["width"],
-                    height=core["height"],
+                        steps=core["steps"],
+                        cfg_scale=core["cfg_scale"],
+                        sampler=core["sampler"],
+                        seed=core["seed"],
+                        clip_skip=core["clip_skip"],
+                        width=core["width"],
+                        height=core["height"],
 
-                    checkpoint_name=identity["checkpoint_name"],
-                    checkpoint_version=identity["checkpoint_version"],
-                    vae_name=identity["vae_name"],
-                )
+                        checkpoint_name=identity["checkpoint_name"],
+                        checkpoint_version=identity["checkpoint_version"],
+                        vae_name=identity["vae_name"],
+                    )
 
-                _store_generation_params(db, item_id, metadata_source)
-                _store_resources(db, item_id, metadata_source)
-
+                # Link immediately so a partial resource/generation issue cannot leave
+                # a newly created item orphaned.
                 db.add_item_to_collection(local_collection_id, item_id, idx)
 
+                _store_generation_params(db, item_id, metadata_source)
+                _store_resources(db, item_id, metadata_source, client)
+
             synced_count += 1
+
+        # Do not auto-clean orphans during sync.
+        # Some images can be created/relinked during this pass; cleanup should be manual
+        # after we confirm stable collection links.
+        orphan_items_removed_after = 0
+
+        sync_report = (
+            f"Collections synced: {synced_count}\n\n"
+            f"Images found: {total_images_found}\n\n"
+            f"Already linked before sync: {already_linked_before_sync}\n\n"
+            f"Re-linked existing items: {relinked_existing_items}\n\n"
+            f"Reused from DB: {reused_from_db}\n\n"
+            f"New items created: {new_items_created}\n\n"
+            f"Newly hydrated: {newly_hydrated}\n\n"
+            f"Incomplete rehydrated: {incomplete_rehydrated}\n\n"
+            f"Detail calls skipped: {reused_from_db}\n\n"
+            f"Orphan items removed before sync: {orphan_items_removed_before}\n\n"
+            f"Orphan items removed after clean sync: {orphan_items_removed_after}"
+        )
 
         if _stop_requested:
             return (
                 _refresh_sidebar_payload(),
-                f"Sync stopped by user: {synced_count} collection(s) synced before stopping.",
+                f"Sync stopped by user.\n\n{sync_report}",
             )
 
         if partial_sync_detected:
             return (
                 _refresh_sidebar_payload(),
-                f"Sync partially completed: {synced_count} collection(s) synced. Reason: {partial_sync_reason}.",
+                f"Sync partially completed.\n\nReason: {partial_sync_reason}\n\n{sync_report}",
             )
 
         return (
             _refresh_sidebar_payload(),
-            f"Sync succeeded: {synced_count} collection(s) synced.",
+            f"Sync succeeded.\n\n{sync_report}",
         )
-
     except Exception as exc:
         print("FETCH ERROR:", repr(exc))
         return (
@@ -1740,6 +3055,67 @@ def on_ui_tabs():
                 color: transparent !important;
             }}
 
+
+            #collection_toolbar_grid_button,
+            #collection_toolbar_scroll_button,
+            #collection_toolbar_detail_button,
+            #collection_toolbar_video_button {{
+                min-width: 28px !important;
+                width: 28px !important;
+                height: 24px !important;
+                min-height: 24px !important;
+                margin-top: 6px !important;
+                margin-left: 4px !important;
+                padding: 0 !important;
+                position: relative !important;
+                overflow: hidden !important;
+                border: none !important;
+                box-shadow: none !important;
+                font-size: 0 !important;
+                color: transparent !important;
+            }}
+
+            #collection_toolbar_grid_button::before {{
+                content: "" !important;
+                position: absolute !important;
+                inset: 0 !important;
+                background-repeat: no-repeat !important;
+                background-position: center !important;
+                background-size: 20px 20px !important;
+                background-image: url("{MAIN_VIEW_ICON_DATA_URI}") !important;
+            }}
+
+            #collection_toolbar_scroll_button::before {{
+                content: "" !important;
+                position: absolute !important;
+                inset: 0 !important;
+                background-repeat: no-repeat !important;
+                background-position: center !important;
+                background-size: 20px 20px !important;
+                background-image: url("{SCROLL_VIEW_ICON_DATA_URI}") !important;
+            }}
+
+            #collection_toolbar_detail_button::before {{
+                content: "" !important;
+                position: absolute !important;
+                inset: 0 !important;
+                background-repeat: no-repeat !important;
+                background-position: center !important;
+                background-size: 20px 20px !important;
+                background-image: url("{DETAIL_VIEW_ICON_DATA_URI}") !important;
+            }}
+
+            #collection_toolbar_video_button::before {{
+                content: "" !important;
+                position: absolute !important;
+                inset: 0 !important;
+                background-repeat: no-repeat !important;
+                background-position: center !important;
+                background-size: 20px 20px !important;
+                background-image: url("{PLAY_PAUSE_ICON_DATA_URI}") !important;
+            }}
+
+
             #collection_toolbar_nsfw_button::before,
             #collection_toolbar_nsfw_button.lg::before {{
                 content: "" !important;
@@ -1773,6 +3149,41 @@ def on_ui_tabs():
                 background-color: #4a5160 !important;
             }}
 
+            #collection_toolbar_grid_button.primary,
+            #collection_toolbar_scroll_button.primary,
+            #collection_toolbar_detail_button.primary,
+            #collection_toolbar_video_button.primary {{
+                background-color: #3a4352 !important;
+            }}
+
+            #collection_toolbar_grid_button.secondary,
+            #collection_toolbar_scroll_button.secondary,
+            #collection_toolbar_detail_button.secondary,
+            #collection_toolbar_video_button.secondary {{
+                background-color: #ff7a1a !important;
+            }}
+
+            #collection_toolbar_grid_button.primary:hover,
+            #collection_toolbar_scroll_button.primary:hover,
+            #collection_toolbar_detail_button.primary:hover,
+            #collection_toolbar_video_button.primary:hover {{
+                background-color: #4a5160 !important;
+            }}
+
+            #collection_toolbar_grid_button.secondary:hover,
+            #collection_toolbar_scroll_button.secondary:hover,
+            #collection_toolbar_detail_button.secondary:hover,
+            #collection_toolbar_video_button.secondary:hover {{
+                background-color: #ff8c33 !important;
+            }}
+
+            #collection_toolbar_row {{
+                background: #d7ecff !important;
+                border-radius: 10px !important;
+                padding: 6px 8px !important;
+                margin-bottom: 6px !important;
+            }}
+
             .collection-cards.collection-view-grid {{
                 display: grid;
                 grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1791,6 +3202,18 @@ def on_ui_tabs():
             value="",
             visible=False,
             elem_id="collection_selected_collection_id",
+        )
+
+        selected_item_id = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_selected_item_id",
+        )
+
+        detail_action = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_detail_action",
         )
 
         batch_offset = gr.Textbox(
@@ -1812,7 +3235,7 @@ def on_ui_tabs():
         )
 
         with gr.Row(equal_height=True):
-            with gr.Column(scale=1, min_width=280):
+            with gr.Column(scale=1, min_width=280, visible=True) as sidebar_column:
                 gr.HTML(
                     """
                     <div style="
@@ -1838,16 +3261,69 @@ def on_ui_tabs():
                     stop_button = gr.Button("Stop", variant="stop")
                     refresh_button = gr.Button("Refresh")
                     clear_cache_button = gr.Button("Clear Cache")
+                    scan_local_files_button = gr.Button("Scan Local Files")
                     reset_button = gr.Button("Reset", variant="stop")
 
                 status_markdown = gr.Markdown("")
 
             with gr.Column(scale=3):
-                with gr.Row(equal_height=False):
-                    with gr.Column(scale=1):
-                        controls_html = gr.HTML(
-                            value=_render_controls_bar(),
-                            elem_id="collection_controls_html",
+                with gr.Row(equal_height=False, elem_id="collection_toolbar_row"):
+                    with gr.Column(scale=0, min_width=36):
+                        gr.HTML(
+                            value=f"""
+                            <div style="
+                                width:28px;
+                                height:24px;
+                                margin-top:6px;
+                                margin-left:4px;
+                                background-image:url('{THUMB_SCALE_ICON_DATA_URI}');
+                                background-repeat:no-repeat;
+                                background-position:center;
+                                background-size:20px 20px;
+                            "></div>
+                            """
+                        )
+
+                    with gr.Column(scale=1, min_width=180):
+                        preview_size_slider = gr.Slider(
+                            minimum=128,
+                            maximum=PREVIEW_SIZE_MAX,
+                            step=16,
+                            value=_preview_size,
+                            show_label=False,
+                            elem_id="collection_preview_size_slider",
+                        )
+
+                    with gr.Column(scale=0, min_width=36):
+                        grid_button = gr.Button(
+                            value="",
+                            elem_id="collection_toolbar_grid_button",
+                            tooltip="Grid view",
+                            variant="primary",
+                        )
+
+                    with gr.Column(scale=0, min_width=36):
+                        scroll_button = gr.Button(
+                            value="",
+                            elem_id="collection_toolbar_scroll_button",
+                            tooltip="Scrolling view",
+                            variant="secondary",
+                        )
+
+                    with gr.Column(scale=0, min_width=36):
+                        detail_button = gr.Button(
+                            value="",
+                            elem_id="collection_toolbar_detail_button",
+                            tooltip="Detailed view",
+                            variant="secondary",
+                        )
+
+                    with gr.Column(scale=0, min_width=36):
+                        video_button = gr.Button(
+                            value="",
+                            elem_id="collection_toolbar_video_button",
+                            tooltip="Play / Pause videos",
+                            variant="primary",
                         )
 
                     with gr.Column(scale=0, min_width=36):
@@ -1857,6 +3333,11 @@ def on_ui_tabs():
                             tooltip="18+",
                             variant="primary",
                         )
+
+                controls_html = gr.HTML(
+                    value=_render_controls_bar(),
+                    elem_id="collection_controls_html",
+                )
 
                 feed_html = gr.HTML(
                     value=_render_feed_html(None),
@@ -1899,10 +3380,85 @@ def on_ui_tabs():
             outputs=[nsfw_toggle_button, controls_html, sidebar_html, feed_html],
        )
 
+        grid_button.click(
+            fn=lambda selected_collection_id_raw, selected_item_id_raw: _set_collection_view(
+                "grid",
+                selected_collection_id_raw,
+                selected_item_id_raw,
+            ),
+            inputs=[selected_collection_id, selected_item_id],
+            outputs=[
+                grid_button,
+                scroll_button,
+                detail_button,
+                sidebar_column,
+                selected_item_id,
+                controls_html,
+                sidebar_html,
+                feed_html,
+            ],
+        )
+
+        scroll_button.click(
+            fn=lambda selected_collection_id_raw, selected_item_id_raw: _set_collection_view(
+                "scroll",
+                selected_collection_id_raw,
+                selected_item_id_raw,
+            ),
+            inputs=[selected_collection_id, selected_item_id],
+            outputs=[
+                grid_button,
+                scroll_button,
+                detail_button,
+                sidebar_column,
+                selected_item_id,
+                controls_html,
+                sidebar_html,
+                feed_html,
+            ],
+        )
+
+        detail_button.click(
+            fn=lambda selected_collection_id_raw, selected_item_id_raw: _set_collection_view(
+                "detail",
+                selected_collection_id_raw,
+                selected_item_id_raw,
+            ),
+            inputs=[selected_collection_id, selected_item_id],
+            outputs=[
+                grid_button,
+                scroll_button,
+                detail_button,
+                sidebar_column,
+                selected_item_id,
+                controls_html,
+                sidebar_html,
+                feed_html,
+            ],
+        )
+
+        preview_size_slider.change(
+            fn=_set_preview_size,
+            inputs=[preview_size_slider, selected_collection_id],
+            outputs=[controls_html, feed_html],
+        )
+
+        video_button.click(
+            fn=_toggle_video_autoplay,
+            inputs=[selected_collection_id],
+            outputs=[video_button, controls_html, feed_html],
+        )
+
         clear_cache_button.click(
             fn=_clear_cache,
             inputs=[],
             outputs=[status_markdown],
+        )
+
+        scan_local_files_button.click(
+            fn=_scan_local_files_for_availability,
+            inputs=[selected_collection_id],
+            outputs=[controls_html, sidebar_html, feed_html, status_markdown],
         )
 
         reset_button.click(
@@ -1915,6 +3471,36 @@ def on_ui_tabs():
             fn=_load_collection_feed,
             inputs=[selected_collection_id],
             outputs=[sidebar_html, feed_html],
+        )
+
+        selected_item_id.change(
+            fn=_open_selected_item_detail,
+            inputs=[selected_collection_id, selected_item_id],
+            outputs=[
+                grid_button,
+                scroll_button,
+                detail_button,
+                sidebar_column,
+                controls_html,
+                sidebar_html,
+                feed_html,
+            ],
+        )
+
+        detail_action.change(
+            fn=_return_detail_to_scroll,
+            inputs=[selected_collection_id, selected_item_id, detail_action],
+            outputs=[
+                grid_button,
+                scroll_button,
+                detail_button,
+                sidebar_column,
+                selected_item_id,
+                detail_action,
+                controls_html,
+                sidebar_html,
+                feed_html,
+            ],
         )
 
         load_more_button.click(

@@ -11,6 +11,8 @@ SOURCE_MODES = {
     "full": "https://civitai.red",
 }
 
+API_BASE_URL = "https://civitai.com"
+
 
 @dataclass
 class CollectionImagePage:
@@ -42,7 +44,7 @@ class CivitaiClient:
 
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         response = requests.get(
-            f"{self.base_url}{path}",
+            f"{API_BASE_URL}{path}",
             params=params or {},
             headers=self._headers(),
             timeout=self.timeout,
@@ -50,15 +52,23 @@ class CivitaiClient:
         response.raise_for_status()
         return response.json()
 
-    def _trpc_get(self, procedure: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _trpc_get(
+        self,
+        procedure: str,
+        payload: Dict[str, Any],
+        base_url: Optional[str] = None,
+        retries: int = 3,
+        log_failures: bool = True,
+    ) -> Dict[str, Any]:
         encoded_input = quote(json.dumps({"json": payload}, separators=(",", ":")))
+        request_base_url = base_url or self.base_url
 
         last_exception = None
 
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
                 response = requests.get(
-                    f"{self.base_url}/api/trpc/{procedure}?input={encoded_input}",
+                    f"{request_base_url}/api/trpc/{procedure}?input={encoded_input}",
                     headers=self._headers(),
                     timeout=self.timeout,
                 )
@@ -67,9 +77,11 @@ class CivitaiClient:
 
             except Exception as e:
                 last_exception = e
-                print(f"[CivitaiClient] Attempt {attempt+1}/3 failed for {procedure}: {repr(e)}")
+                if log_failures:
+                    print(f"[CivitaiClient] Attempt {attempt+1}/{retries} failed for {procedure}: {repr(e)}")
 
-        print("[CivitaiClient] All retries failed.")
+        if log_failures:
+            print("[CivitaiClient] All retries failed.")
         raise last_exception
 
     def get_all_user_collections(self) -> List[Dict[str, Any]]:
@@ -90,15 +102,58 @@ class CivitaiClient:
         if not self.api_key:
             return {}
 
-        payload = self._trpc_get("image.get", {"id": image_id})
-        return payload.get("result", {}).get("data", {}).get("json", {}) or {}
+        for base_url in [self.base_url, API_BASE_URL]:
+            try:
+                payload = self._trpc_get(
+                    "image.get",
+                    {"id": image_id},
+                    base_url=base_url,
+                    retries=1,
+                    log_failures=False,
+                )
+                return payload.get("result", {}).get("data", {}).get("json", {}) or {}
+            except Exception:
+                continue
+
+        return {}
 
     def get_image_generation_data(self, image_id: int) -> Dict[str, Any]:
         if not self.api_key:
             return {}
 
-        payload = self._trpc_get("image.getGenerationData", {"id": image_id})
-        return payload.get("result", {}).get("data", {}).get("json", {}) or {}
+        for base_url in [self.base_url, API_BASE_URL]:
+            try:
+                payload = self._trpc_get(
+                    "image.getGenerationData",
+                    {"id": image_id},
+                    base_url=base_url,
+                    retries=1,
+                    log_failures=False,
+                )
+                return payload.get("result", {}).get("data", {}).get("json", {}) or {}
+            except Exception:
+                continue
+
+        return {}
+
+    def get_model_version(self, version_id: int) -> Dict[str, Any]:
+        if not self.api_key:
+            return {}
+
+        try:
+            return self._get(f"/api/v1/model-versions/{int(version_id)}")
+        except Exception:
+            return {}
+
+    def get_model_version_by_hash(self, file_hash: str) -> Dict[str, Any]:
+        clean_hash = str(file_hash or "").strip()
+        if not clean_hash:
+            return {}
+
+        try:
+            return self._get(f"/api/v1/model-versions/by-hash/{clean_hash}")
+        except Exception:
+            return {}
 
     def get_collection_images(
         self,
