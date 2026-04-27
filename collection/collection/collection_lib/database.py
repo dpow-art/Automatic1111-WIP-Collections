@@ -217,6 +217,43 @@ class CollectionDatabase:
             )
             return int(cur.lastrowid)
 
+    def rename_local_collection(self, collection_id: int, name: str) -> bool:
+        clean_name = (name or "").strip()
+        if not clean_name:
+            return False
+
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE collections
+                SET name = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND type = 'local'
+                """,
+                (clean_name, collection_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_local_collection(self, collection_id: int) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM collections WHERE id = ? AND type = 'local'",
+                (collection_id,),
+            ).fetchone()
+
+            if not row:
+                return False
+
+            conn.execute(
+                "DELETE FROM collection_items WHERE collection_id = ?",
+                (collection_id,),
+            )
+            conn.execute(
+                "DELETE FROM collections WHERE id = ? AND type = 'local'",
+                (collection_id,),
+            )
+
+        return True
+
     def list_collections(self, collection_type: str) -> List[Dict[str, Any]]:
         query = """
             SELECT c.id, c.name, c.type, c.updated_at,
@@ -729,6 +766,80 @@ class CollectionDatabase:
                 """,
                 (collection_id, item_id, order_index),
             )
+
+    def reorder_local_collection_items(self, collection_id: int, ordered_item_ids: List[int]) -> bool:
+        clean_ids: List[int] = []
+        seen = set()
+
+        for item_id in ordered_item_ids:
+            try:
+                clean_id = int(item_id)
+            except Exception:
+                continue
+
+            if clean_id in seen:
+                continue
+
+            seen.add(clean_id)
+            clean_ids.append(clean_id)
+
+        if not clean_ids:
+            return False
+
+        with self.connect() as conn:
+            collection = conn.execute(
+                "SELECT id FROM collections WHERE id = ? AND type = 'local'",
+                (collection_id,),
+            ).fetchone()
+
+            if not collection:
+                return False
+
+            existing_rows = conn.execute(
+                """
+                SELECT item_id
+                FROM collection_items
+                WHERE collection_id = ?
+                ORDER BY order_index ASC, item_id ASC
+                """,
+                (collection_id,),
+            ).fetchall()
+
+            existing_ids = [int(row["item_id"]) for row in existing_rows]
+            existing_set = set(existing_ids)
+
+            ordered_existing_ids = [
+                item_id for item_id in clean_ids
+                if item_id in existing_set
+            ]
+
+            remaining_ids = [
+                item_id for item_id in existing_ids
+                if item_id not in set(ordered_existing_ids)
+            ]
+
+            final_ids = ordered_existing_ids + remaining_ids
+
+            for index, item_id in enumerate(final_ids):
+                conn.execute(
+                    """
+                    UPDATE collection_items
+                    SET order_index = ?
+                    WHERE collection_id = ? AND item_id = ?
+                    """,
+                    (index, collection_id, item_id),
+                )
+
+            conn.execute(
+                """
+                UPDATE collections
+                SET updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND type = 'local'
+                """,
+                (collection_id,),
+            )
+
+        return True
 
     def clear_collection_items(self, collection_id: int) -> None:
         with self.connect() as conn:

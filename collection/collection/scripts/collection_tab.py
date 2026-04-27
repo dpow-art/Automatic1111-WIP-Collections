@@ -22,7 +22,9 @@ EXTENSION_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = EXTENSION_ROOT / "data"
 DEFAULT_DB_PATH = DATA_DIR / "collections.db"
 DEFAULT_IMAGE_CACHE_DIR = DATA_DIR / "images"
-INITIAL_BATCH_SIZE = 35
+
+IMAGE_BATCH_SIZE = 35
+VIDEO_BATCH_SIZE = 20
 
 NSFW_ON_ICON_PATH = EXTENSION_ROOT / "assets" / "icons" / "nsfw_on.svg"
 NSFW_ON_ICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
@@ -60,11 +62,14 @@ _stop_requested: bool = False
 _current_view: str = "grid"
 _active_collection_id: Optional[int] = None
 _selected_item_id: Optional[int] = None
+_target_local_collection_id: Optional[int] = None
 _video_autoplay_enabled: bool = True
+_active_cache_filter: str = "sync"
 _local_resource_index_cache: Dict[str, Any] = {}
 _model_version_hash_cache: Dict[str, Dict[str, str]] = {}
-_preview_size: int = 128
-PREVIEW_SIZE_MAX = 400
+PREVIEW_SIZE_STEPS = [144, 192, 208, 256, 320, 512, 720]
+_preview_size: int = 144
+PREVIEW_SIZE_MAX = 720
 
 DETAIL_REQUEST_DELAY_SECONDS = 1.25
 DETAIL_REQUEST_FAILURE_BACKOFF_SECONDS = 8.0
@@ -418,7 +423,9 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
                 onclick="(function() {{
                     const root = gradioApp();
                     const selectedEl = root.querySelector('#collection_selected_collection_id textarea, #collection_selected_collection_id input');
+
                     if (!selectedEl) return;
+
                     selectedEl.value = '{cid}';
                     selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
@@ -464,7 +471,11 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
         )
 
     return f"""
-    <div style="position:relative; height:100%; min-height:300px;">
+    <div style="
+        position:relative;
+        height:100%;
+        overflow:hidden;
+    ">
         {_render_sfw_indicator()}
         <div style="
             height:100%;
@@ -478,8 +489,87 @@ def _refresh_sidebar_payload(selected_collection_id: Optional[int] = None) -> st
     """
 
 
+def _refresh_local_collections_payload(
+    selected_collection_id: Optional[int] = None,
+    target_collection_id: Optional[int] = None,
+) -> str:
+    global _target_local_collection_id
+
+    if target_collection_id is None:
+        target_collection_id = _target_local_collection_id
+
+    db = _get_db()
+    collections = db.list_collections("local")
+
+    rows: List[str] = []
+    for collection in collections:
+        cid = int(collection["id"])
+        name = html.escape(collection["name"])
+        active = cid == target_collection_id
+        items = db.list_items_for_collection(cid)
+
+        image_count = len([item for item in items if not _item_is_video(item)])
+        video_count = len([item for item in items if _item_is_video(item)])
+
+        bg = "#202020" if active else "transparent"
+        border = "#4b4b4b" if active else "transparent"
+        text = "#ffffff" if active else "#d4d4d4"
+
+        rows.append(f"""
+        <button
+            type="button"
+            onclick="(function() {{
+                const root = gradioApp();
+                const targetEl = root.querySelector('#collection_target_local_collection_id textarea, #collection_target_local_collection_id input');
+                const button = root.querySelector('#collection_target_local_collection_button');
+
+                if (!targetEl || !button) return;
+
+                targetEl.value = '{cid}';
+                targetEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                targetEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+                button.click();
+            }})()"
+            style="
+                width:100%;
+                text-align:left;
+                margin:0 0 6px 0;
+                padding:10px 12px;
+                border-radius:10px;
+                border:1px solid {border};
+                background:{bg};
+                color:{text};
+                cursor:pointer;
+            "
+        >
+            <div style="font-size:13px;font-weight:600;">{name}</div>
+            <div style="font-size:11px;color:#8f8f8f;margin-top:2px;">
+                {image_count} images · {video_count} videos{" · Add Target" if active else ""}
+            </div>
+        </button>
+        """)
+
+    if not rows:
+        rows.append("""
+        <div style="padding:8px 4px;color:#6f7682;font-size:12px;">
+            No local collections yet.
+        </div>
+        """)
+
+    return f"""
+    <div style="
+        max-height:180px;
+        overflow:auto;
+        padding-top:8px;
+    ">
+        {''.join(rows)}
+    </div>
+    """
+
+
 def _render_controls_bar() -> str:
-    global _hide_nsfw, _current_view, _preview_size, _video_autoplay_enabled
+    global _hide_nsfw, _current_view, _preview_size, _video_autoplay_enabled, _active_cache_filter
 
     view_label = {
         "grid": "Grid",
@@ -488,6 +578,12 @@ def _render_controls_bar() -> str:
     }.get(_current_view, "Grid")
 
     video_label = "Videos: Play" if _video_autoplay_enabled else "Videos: Pause"
+
+    filter_label = {
+        "sync": "Sync",
+        "preview": "Prvw",
+        "full": "Full",
+    }.get(_active_cache_filter, "Sync")
 
     return f"""
     <div style="
@@ -499,10 +595,22 @@ def _render_controls_bar() -> str:
         gap:12px;
     ">
         <span>View: {html.escape(view_label)}</span>
+        <span>Filter: {html.escape(filter_label)}</span>
         <span>Preview: {int(_preview_size)}px</span>
         <span>{html.escape(video_label)}</span>
     </div>
     """
+
+
+def _path_exists(path_value: Any) -> bool:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return False
+
+    try:
+        return Path(path_text).exists()
+    except Exception:
+        return False
 
 
 def _get_filtered_items_for_collection(collection_id: int) -> List[Dict[str, Any]]:
@@ -527,14 +635,47 @@ def _get_filtered_items_for_collection(collection_id: int) -> List[Dict[str, Any
 
         items = filtered_items
 
+    global _active_cache_filter
+
+    if _active_cache_filter == "preview":
+        items = [
+            item for item in items
+            if _path_exists(item.get("preview_path"))
+        ]
+    elif _active_cache_filter == "full":
+        items = [
+            item for item in items
+            if _path_exists(item.get("full_path"))
+        ]
+
     return items
 
 
-def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
-    global _video_autoplay_enabled
+def _collection_allows_reorder(collection_id: Optional[int]) -> bool:
+    global _active_cache_filter
+
+    if not collection_id:
+        return False
+
+    if _active_cache_filter != "sync":
+        return False
+
+    db = _get_db()
+    collection = db.get_collection(int(collection_id))
+
+    return bool(collection and collection.get("type") == "local")
+
+
+def _render_feed_cards(
+    items: List[Dict[str, Any]],
+    collection_id: Optional[int] = None,
+    allow_reorder: bool = False,
+) -> str:
+    global _video_autoplay_enabled, _active_cache_filter
 
     cards: List[str] = []
     video_autoplay_attr = "autoplay" if _video_autoplay_enabled else ""
+    show_add_overlay = _active_cache_filter in {"preview", "full"}
 
     for item in items:
         preview_source = item.get("preview_path") or item.get("image_url") or ""
@@ -548,98 +689,244 @@ def _render_feed_cards(items: List[Dict[str, Any]]) -> str:
         thumb_html = ""
         item_id = int(item["id"])
 
+        reorder_attrs = ""
+        if allow_reorder and collection_id:
+            reorder_attrs = f"""
+                draggable="true"
+                data-reorder-item-id="{item_id}"
+                ondragstart="(function(event, el) {{
+                    event.dataTransfer.setData('text/plain', '{item_id}');
+                    el.style.opacity = '0.45';
+                }})(event, this)"
+                ondragend="this.style.opacity = '1'"
+                ondragover="event.preventDefault();"
+                ondrop="(function(event, el) {{
+                    event.preventDefault();
+
+                    const root = gradioApp();
+                    const container = el.closest('#collection_cards_container, .collection-cards');
+                    const payloadEl = root.querySelector('#collection_reorder_payload textarea, #collection_reorder_payload input');
+                    const button = root.querySelector('#collection_reorder_button');
+
+                    if (!container || !payloadEl || !button) return;
+
+                    const draggedId = event.dataTransfer.getData('text/plain');
+                    const cards = Array.from(container.querySelectorAll('[data-reorder-item-id]'));
+
+                    let dragged = null;
+                    for (let c of cards) {{
+                        if (c.getAttribute('data-reorder-item-id') === draggedId) {{
+                            dragged = c;
+                            break;
+                        }}
+                    }}
+
+                    if (!dragged || dragged === el) return;
+
+                    const draggedIndex = cards.indexOf(dragged);
+                    const dropIndex = cards.indexOf(el);
+
+                    if (draggedIndex < 0 || dropIndex < 0) return;
+
+                    if (draggedIndex < dropIndex) {{
+                        el.after(dragged);
+                    }} else {{
+                        el.before(dragged);
+                    }}
+
+                    const orderedIds = Array.from(container.querySelectorAll('[data-reorder-item-id]'))
+                        .map(function(card) {{
+                            return card.getAttribute('data-reorder-item-id');
+                        }});
+
+                    payloadEl.value = JSON.stringify({{
+                        collection_id: {int(collection_id)},
+                        item_ids: orderedIds
+                    }});
+
+                    payloadEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    payloadEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+                    button.click();
+                }})(event, this)"
+            """
+
+        add_overlay_html = ""
+        if show_add_overlay:
+            add_overlay_html = f"""
+            <button
+                type="button"
+                class="collection-add-btn"
+                title="Add to selected local collection"
+                onclick="(function(event) {{
+                    event.preventDefault();
+                    event.stopPropagation();
+
+                    const root = gradioApp();
+                    const itemEl = root.querySelector('#collection_local_add_item_id textarea, #collection_local_add_item_id input');
+                    const button = root.querySelector('#collection_local_add_item_button');
+
+                    if (!itemEl || !button) return;
+
+                    itemEl.value = '{item_id}';
+                    itemEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    itemEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+                    button.click();
+                }})(event)"
+                style="
+                    position:absolute;
+                    top:14px;
+                    right:14px;
+                    width:26px;
+                    height:26px;
+                    border-radius:999px;
+                    background:rgba(0,0,0,0.68);
+                    border:1px solid #555;
+                    color:#ffffff;
+                    font-size:17px;
+                    font-weight:800;
+                    line-height:1;
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    cursor:pointer;
+                    opacity:0;
+                    transition:opacity 0.15s ease;
+                    z-index:5;
+                    padding:0;
+                "
+            >+</button>
+            """
+
         if image_url and not is_mp4:
             thumb_html = f"""
-            <button
-                id="collection_card_{item_id}"
-                data-item-id="{item_id}"
-                type="button"
-                class="collection-card"
-                onclick="(function() {{
-                    const root = gradioApp();
-                    const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
-                    if (!selectedEl) return;
-                    selectedEl.value = '{item_id}';
-                    selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }})()"
+            <div
+                class="collection-card-shell"
+                {reorder_attrs}
                 style="
-                background:#171717;
-                border:1px solid #272727;
-                border-radius:14px;
-                padding:8px;
-                box-sizing:border-box;
-                width:100%;
-            ">
-                <div style="
+                    position:relative;
                     width:100%;
-                    aspect-ratio:1 / 1.25;
-                    overflow:hidden;
-                    border-radius:12px;
-                    background:#202020;
+                "
+                onmouseover="(function(el) {{
+                    const btn = el.querySelector('.collection-add-btn');
+                    if (btn) btn.style.opacity = '1';
+                }})(this)"
+                onmouseout="(function(el) {{
+                    const btn = el.querySelector('.collection-add-btn');
+                    if (btn) btn.style.opacity = '0';
+                }})(this)"
+            >
+                {add_overlay_html}
+                <button
+                    id="collection_card_{item_id}"
+                    data-item-id="{item_id}"
+                    type="button"
+                    class="collection-card"
+                    onclick="(function() {{
+                        const root = gradioApp();
+                        const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+                        if (!selectedEl) return;
+                        selectedEl.value = '{item_id}';
+                        selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }})()"
+                    style="
+                    background:#171717;
+                    border:1px solid #272727;
+                    border-radius:14px;
+                    padding:8px;
+                    box-sizing:border-box;
+                    width:100%;
                 ">
-                    <img
-                        src="{image_url}"
-                        alt="{safe_title}"
-                        loading="lazy"
-                        style="
-                            width:100%;
-                            height:100%;
-                            object-fit:cover;
-                            display:block;
-                        "
-                    />
-                </div>
-            </button>
+                    <div style="
+                        width:100%;
+                        aspect-ratio:1 / 1.25;
+                        overflow:hidden;
+                        border-radius:12px;
+                        background:#202020;
+                    ">
+                        <img
+                            src="{image_url}"
+                            alt="{safe_title}"
+                            loading="lazy"
+                            style="
+                                width:100%;
+                                height:100%;
+                                object-fit:cover;
+                                display:block;
+                            "
+                        />
+                    </div>
+                </button>
+            </div>
             """
         elif is_mp4:
             thumb_html = f"""
-            <button
-                id="collection_card_{item_id}"
-                data-item-id="{item_id}"
-                type="button"
-                class="collection-card"
-                onclick="(function() {{
-                    const root = gradioApp();
-                    const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
-                    if (!selectedEl) return;
-                    selectedEl.value = '{item_id}';
-                    selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                }})()"
+            <div
+                class="collection-card-shell"
+                {reorder_attrs}
                 style="
-                background:#171717;
-                border:1px solid #272727;
-                border-radius:14px;
-                padding:8px;
-                box-sizing:border-box;
-                width:100%;
-            ">
-                <div style="
+                    position:relative;
                     width:100%;
-                    aspect-ratio:1 / 1.25;
-                    overflow:hidden;
-                    border-radius:12px;
-                    background:#202020;
-            ">
-                    <video 
-                        class="collection-preview-video"
-                        src="{image_url}"
-                        {video_autoplay_attr}
-                        loop
-                        muted
-                        playsinline
-                        preload="metadata"
-                        style="
-                            width:100%;
-                            height:100%;
-                            object-fit:cover;
-                            display:block;
-                            background:#202020;
-                        "
-                    ></video>
-                </div>
-            </button>
+                "
+                onmouseover="(function(el) {{
+                    const btn = el.querySelector('.collection-add-btn');
+                    if (btn) btn.style.opacity = '1';
+                }})(this)"
+                onmouseout="(function(el) {{
+                    const btn = el.querySelector('.collection-add-btn');
+                    if (btn) btn.style.opacity = '0';
+                }})(this)"
+            >
+                {add_overlay_html}
+                <button
+                    id="collection_card_{item_id}"
+                    data-item-id="{item_id}"
+                    type="button"
+                    class="collection-card"
+                    onclick="(function() {{
+                        const root = gradioApp();
+                        const selectedEl = root.querySelector('#collection_selected_item_id textarea, #collection_selected_item_id input');
+                        if (!selectedEl) return;
+                        selectedEl.value = '{item_id}';
+                        selectedEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        selectedEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }})()"
+                    style="
+                    background:#171717;
+                    border:1px solid #272727;
+                    border-radius:14px;
+                    padding:8px;
+                    box-sizing:border-box;
+                    width:100%;
+                ">
+                    <div style="
+                        width:100%;
+                        aspect-ratio:1 / 1.25;
+                        overflow:hidden;
+                        border-radius:12px;
+                        background:#202020;
+                ">
+                        <video 
+                            class="collection-preview-video"
+                            src="{image_url}"
+                            {video_autoplay_attr}
+                            loop
+                            muted
+                            playsinline
+                            preload="metadata"
+                            style="
+                                width:100%;
+                                height:100%;
+                                object-fit:cover;
+                                display:block;
+                                background:#202020;
+                            "
+                        ></video>
+                    </div>
+                </button>
+            </div>
             """
         else:
             thumb_html = f"""
@@ -1512,16 +1799,174 @@ def _render_detail_view(item: Optional[Dict[str, Any]], collection_id: int) -> s
     """
 
 
-def _render_feed_batch(collection_id: int, offset: int, limit: int = INITIAL_BATCH_SIZE) -> tuple[str, int, bool]:
+def _split_media_items(items: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    image_items: List[Dict[str, Any]] = []
+    video_items: List[Dict[str, Any]] = []
+
+    for item in items:
+        if _item_is_video(item):
+            video_items.append(item)
+        else:
+            image_items.append(item)
+
+    return image_items, video_items
+
+
+def _render_feed_batch(
+    collection_id: int,
+    offset: int,
+    limit: int = IMAGE_BATCH_SIZE,
+    media_kind: str = "all",
+) -> tuple[str, int, bool]:
     items = _get_filtered_items_for_collection(collection_id)
+
+    if media_kind == "image":
+        items = [item for item in items if not _item_is_video(item)]
+    elif media_kind == "video":
+        items = [item for item in items if _item_is_video(item)]
+
     batch_items = items[offset:offset + limit]
-    cards_html = _render_feed_cards(batch_items)
+    cards_html = _render_feed_cards(
+        batch_items,
+        collection_id=collection_id,
+        allow_reorder=_collection_allows_reorder(collection_id),
+    )
     next_offset = offset + len(batch_items)
     has_more = next_offset < len(items)
     return cards_html, next_offset, has_more
 
 
-def _render_feed_html(collection_id: Optional[int]) -> str:
+def _render_video_batch_section(
+    collection_id: int,
+    video_items: List[Dict[str, Any]],
+    video_offset: int = 0,
+    mixed_collection: bool = False,
+) -> str:
+    global _preview_size
+
+    total_videos = len(video_items)
+    safe_offset = max(0, min(video_offset, max(0, total_videos - 1)))
+    safe_offset = (safe_offset // VIDEO_BATCH_SIZE) * VIDEO_BATCH_SIZE
+
+    batch_items = video_items[safe_offset:safe_offset + VIDEO_BATCH_SIZE]
+    cards_html = _render_feed_cards(
+        batch_items,
+        collection_id=collection_id,
+        allow_reorder=_collection_allows_reorder(collection_id),
+    )
+
+    previous_offset = max(0, safe_offset - VIDEO_BATCH_SIZE)
+    next_offset = safe_offset + VIDEO_BATCH_SIZE
+
+    has_previous = safe_offset > 0
+    has_next = next_offset < total_videos
+
+    start_label = safe_offset + 1 if total_videos else 0
+    end_label = min(safe_offset + len(batch_items), total_videos)
+
+    section_title = "Videos" if mixed_collection else "Video Collection"
+    top_margin = "28px" if mixed_collection else "0"
+
+    previous_disabled = "disabled" if not has_previous else ""
+    next_disabled = "disabled" if not has_next else ""
+
+    previous_opacity = "0.35" if not has_previous else "1"
+    next_opacity = "0.35" if not has_next else "1"
+
+    return f"""
+    <div
+        id="collection_video_section"
+        style="
+            margin-top:{top_margin};
+            padding-top:4px;
+        "
+    >
+        <div style="
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            margin-bottom:10px;
+            color:#d8d8d8;
+        ">
+            <div>
+                <div style="font-size:16px;font-weight:700;">{section_title}</div>
+                <div style="font-size:12px;color:#8a8a8a;">
+                    Showing videos {start_label}–{end_label} of {total_videos}
+                </div>
+            </div>
+
+            <div style="display:flex;gap:8px;">
+                <button
+                    type="button"
+                    {previous_disabled}
+                    onclick="(function() {{
+                        const root = gradioApp();
+                        const offsetEl = root.querySelector('#collection_video_batch_offset textarea, #collection_video_batch_offset input');
+                        const button = root.querySelector('#collection_video_batch_button');
+                        if (!offsetEl || !button) return;
+                        offsetEl.value = '{previous_offset}';
+                        offsetEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        offsetEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        button.click();
+                    }})()"
+                    style="
+                        opacity:{previous_opacity};
+                        border:1px solid #333;
+                        background:#202020;
+                        color:#d8d8d8;
+                        border-radius:8px;
+                        padding:7px 10px;
+                        cursor:pointer;
+                    "
+                >
+                    Previous Videos
+                </button>
+
+                <button
+                    type="button"
+                    {next_disabled}
+                    onclick="(function() {{
+                        const root = gradioApp();
+                        const offsetEl = root.querySelector('#collection_video_batch_offset textarea, #collection_video_batch_offset input');
+                        const button = root.querySelector('#collection_video_batch_button');
+                        if (!offsetEl || !button) return;
+                        offsetEl.value = '{next_offset}';
+                        offsetEl.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                        offsetEl.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        button.click();
+                    }})()"
+                    style="
+                        opacity:{next_opacity};
+                        border:1px solid #333;
+                        background:#202020;
+                        color:#d8d8d8;
+                        border-radius:8px;
+                        padding:7px 10px;
+                        cursor:pointer;
+                    "
+                >
+                    Next Videos
+                </button>
+            </div>
+        </div>
+
+        <div
+            class="collection-cards collection-view-grid"
+            style="
+                display:grid;
+                grid-template-columns:repeat(auto-fill, minmax({int(_preview_size)}px, 1fr));
+                gap:12px;
+                align-items:start;
+            "
+        >
+            {cards_html}
+        </div>
+    </div>
+    """
+
+
+def _render_feed_html(collection_id: Optional[int], video_offset: int = 0) -> str:
     global _current_view, _preview_size, _selected_item_id
 
     if _current_view == "detail" and collection_id:
@@ -1565,10 +2010,15 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
         </div>
         """
 
+    image_items, video_items = _split_media_items(items)
+    has_images = len(image_items) > 0
+    has_videos = len(video_items) > 0
+    is_mixed_collection = has_images and has_videos
+
     initial_offset = 0
 
     if _current_view == "scroll" and _selected_item_id is not None:
-        for index, item in enumerate(items):
+        for index, item in enumerate(image_items if has_images else items):
             try:
                 if int(item["id"]) == int(_selected_item_id):
                     initial_offset = max(0, index - 4)
@@ -1576,13 +2026,47 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
             except Exception:
                 pass
 
+    if has_videos and not has_images:
+        video_section_html = _render_video_batch_section(
+            collection_id=collection_id,
+            video_items=video_items,
+            video_offset=video_offset,
+            mixed_collection=False,
+        )
+
+        return f"""
+        <div
+            id="collection_feed_root"
+            class="collection-feed-root"
+            style="
+                height:100%;
+                min-height:480px;
+                overflow:auto;
+                padding:12px;
+                box-sizing:border-box;
+            "
+        >
+            {video_section_html}
+        </div>
+        """
+
     cards_html, next_offset, has_more = _render_feed_batch(
         collection_id=collection_id,
         offset=initial_offset,
-        limit=INITIAL_BATCH_SIZE,
+        limit=IMAGE_BATCH_SIZE,
+        media_kind="image",
     )
 
-    sentinel_text = "Loading more..." if has_more else "End of collection"
+    sentinel_text = "Loading more images..." if has_more else "End of images"
+
+    video_section_html = ""
+    if is_mixed_collection:
+        video_section_html = _render_video_batch_section(
+            collection_id=collection_id,
+            video_items=video_items,
+            video_offset=video_offset,
+            mixed_collection=True,
+        )
 
     return f"""
     <div
@@ -1596,6 +2080,24 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
             box-sizing:border-box;
         "
     >
+        {f'''
+        <div style="
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            margin-bottom:10px;
+            color:#d8d8d8;
+        ">
+            <div>
+                <div style="font-size:16px;font-weight:700;">Images</div>
+                <div style="font-size:12px;color:#8a8a8a;">
+                    {len(image_items)} images · {len(video_items)} videos
+                </div>
+            </div>
+        </div>
+        ''' if is_mixed_collection else ""}
+
         <div
             id="collection_cards_container"
             class="collection-cards collection-view-grid"
@@ -1624,11 +2126,13 @@ def _render_feed_html(collection_id: Optional[int]) -> str:
         >
             {sentinel_text}
         </div>
+
+        {video_section_html}
     </div>
     """
 
 
-def _load_collection_feed(selected_collection_id_raw: str) -> tuple[str, str]:
+def _load_collection_feed(selected_collection_id_raw: str) -> tuple[str, str, str, str]:
     global _active_collection_id
 
     selected_collection_id: Optional[int] = None
@@ -1644,6 +2148,8 @@ def _load_collection_feed(selected_collection_id_raw: str) -> tuple[str, str]:
     return (
         _refresh_sidebar_payload(selected_collection_id),
         _render_feed_html(selected_collection_id),
+        _selected_local_collection_name(selected_collection_id),
+        _refresh_local_collections_payload(selected_collection_id),
     )
 
 
@@ -1670,7 +2176,8 @@ def _load_more_feed_batch(selected_collection_id_raw: str, batch_offset_raw: str
     cards_html, next_offset, has_more = _render_feed_batch(
         collection_id=selected_collection_id,
         offset=batch_offset,
-        limit=INITIAL_BATCH_SIZE,
+        limit=IMAGE_BATCH_SIZE,
+        media_kind="image",
     )
 
     payload_json = json.dumps(
@@ -1683,14 +2190,434 @@ def _load_more_feed_batch(selected_collection_id_raw: str, batch_offset_raw: str
     return f'<div class="collection-batch-payload" data-json="{html.escape(payload_json, quote=True)}"></div>'
 
 
-def _create_local_collection(name: str) -> str:
-    if not name or not name.strip():
-        return _refresh_sidebar_payload()
+def _set_video_batch(selected_collection_id_raw: str, video_offset_raw: str) -> str:
+    selected_collection_id: Optional[int] = None
+    video_offset = 0
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    try:
+        if video_offset_raw and str(video_offset_raw).strip():
+            video_offset = max(0, int(str(video_offset_raw).strip()))
+    except Exception:
+        video_offset = 0
+
+    return _render_feed_html(selected_collection_id, video_offset=video_offset)
+
+
+def _selected_local_collection_name(selected_collection_id: Optional[int]) -> str:
+    if not selected_collection_id:
+        return ""
 
     db = _get_db()
-    db.create_collection(name=name.strip(), collection_type="local")
-    return _refresh_sidebar_payload()
+    collection = db.get_collection(int(selected_collection_id))
+    if not collection or collection.get("type") != "local":
+        return ""
 
+    return collection.get("name") or ""
+
+
+def _unique_local_collection_name(base_name: str = "New Collection") -> str:
+    db = _get_db()
+    local_names = {
+        (collection.get("name") or "").strip().lower()
+        for collection in db.list_collections("local")
+    }
+
+    clean_base = (base_name or "New Collection").strip() or "New Collection"
+
+    if clean_base.lower() not in local_names:
+        return clean_base
+
+    index = 2
+    while True:
+        candidate = f"{clean_base} {index}"
+        if candidate.lower() not in local_names:
+            return candidate
+        index += 1
+
+
+def _create_local_collection(name: str):
+    global _target_local_collection_id
+
+    db = _get_db()
+    collection_name = _unique_local_collection_name(name or "New Collection")
+    collection_id = db.create_collection(name=collection_name, collection_type="local")
+    _target_local_collection_id = collection_id
+
+    return (
+        gr.update(value=str(collection_id)),
+        gr.update(value=str(collection_id)),
+        _refresh_sidebar_payload(collection_id),
+        _render_feed_html(collection_id),
+        gr.update(value=collection_name),
+        _refresh_local_collections_payload(collection_id, collection_id),
+        f"Local collection created: {collection_name}",
+    )
+
+
+def _set_target_local_collection(target_collection_id_raw: str, selected_collection_id_raw: str):
+    global _target_local_collection_id, _active_cache_filter, _active_collection_id
+
+    target_collection_id: Optional[int] = None
+    selected_collection_id: Optional[int] = None
+
+    try:
+        if target_collection_id_raw and str(target_collection_id_raw).strip():
+            target_collection_id = int(str(target_collection_id_raw).strip())
+    except Exception:
+        target_collection_id = None
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not target_collection_id:
+        return (
+            gr.update(),
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            _selected_local_collection_name(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            "No local collection selected as add target.",
+        )
+
+    db = _get_db()
+    collection = db.get_collection(target_collection_id)
+
+    if not collection or collection.get("type") != "local":
+        return (
+            gr.update(),
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            _selected_local_collection_name(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Only local collections can be used as add targets.",
+        )
+
+    _target_local_collection_id = target_collection_id
+
+    view_collection_id = selected_collection_id
+    selected_update = gr.update()
+
+    if _active_cache_filter == "sync":
+        view_collection_id = target_collection_id
+        _active_collection_id = target_collection_id
+        selected_update = gr.update(value=str(target_collection_id))
+
+    collection_name = collection.get("name") or "Local Collection"
+
+    return (
+        selected_update,
+        _refresh_sidebar_payload(view_collection_id),
+        _render_feed_html(view_collection_id),
+        _selected_local_collection_name(view_collection_id),
+        _refresh_local_collections_payload(
+            view_collection_id,
+            target_collection_id,
+        ),
+        f"Add target selected: {collection_name}",
+    )
+
+
+def _rename_selected_local_collection(selected_collection_id_raw: str, name: str):
+    selected_collection_id: Optional[int] = None
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not selected_collection_id:
+        return (
+            _refresh_sidebar_payload(),
+            gr.update(),
+            _refresh_local_collections_payload(),
+            "Select a local collection before renaming.",
+        )
+
+    clean_name = (name or "").strip()
+    if not clean_name:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            gr.update(),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Local collection name cannot be blank.",
+        )
+
+    db = _get_db()
+    collection = db.get_collection(selected_collection_id)
+    if not collection or collection.get("type") != "local":
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            gr.update(value=""),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Only local collections can be renamed.",
+        )
+
+    renamed = db.rename_local_collection(selected_collection_id, clean_name)
+
+    if not renamed:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            gr.update(),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Rename failed.",
+        )
+
+    return (
+        _refresh_sidebar_payload(selected_collection_id),
+        gr.update(value=clean_name),
+        _refresh_local_collections_payload(selected_collection_id),
+        f"Local collection renamed: {clean_name}",
+    )
+
+
+def _delete_selected_local_collection(selected_collection_id_raw: str, confirm_collection_id_raw: str):
+    selected_collection_id: Optional[int] = None
+    confirm_collection_id = str(confirm_collection_id_raw or "").strip()
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not selected_collection_id:
+        return (
+            gr.update(value=""),
+            gr.update(value=""),
+            _refresh_sidebar_payload(),
+            _render_feed_html(None),
+            gr.update(value=""),
+            _refresh_local_collections_payload(),
+            "Select a local collection before deleting.",
+        )
+
+    db = _get_db()
+    collection = db.get_collection(selected_collection_id)
+
+    if not collection or collection.get("type") != "local":
+        return (
+            gr.update(value=str(selected_collection_id)),
+            gr.update(value=""),
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            gr.update(value=""),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Only local collections can be deleted.",
+        )
+
+    collection_name = collection.get("name") or "Local Collection"
+
+    if confirm_collection_id != str(selected_collection_id):
+        return (
+            gr.update(value=str(selected_collection_id)),
+            gr.update(value=str(selected_collection_id)),
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            gr.update(value=collection_name),
+            _refresh_local_collections_payload(selected_collection_id),
+            f"Press − again to confirm deleting local collection: {collection_name}. Files will not be deleted.",
+        )
+
+    deleted = db.delete_local_collection(selected_collection_id)
+
+    if not deleted:
+        return (
+            gr.update(value=str(selected_collection_id)),
+            gr.update(value=""),
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            gr.update(value=collection_name),
+            _refresh_local_collections_payload(selected_collection_id),
+            "Delete failed.",
+        )
+
+    return (
+        gr.update(value=""),
+        gr.update(value=""),
+        _refresh_sidebar_payload(),
+        _render_feed_html(None),
+        gr.update(value=""),
+        _refresh_local_collections_payload(),
+        f"Local collection deleted: {collection_name}. Files were not deleted.",
+    )
+
+
+def _add_item_to_target_local_collection(
+    item_id_raw: str,
+    target_collection_id_raw: str,
+    selected_collection_id_raw: str,
+):
+    global _active_cache_filter
+
+    if _active_cache_filter not in {"preview", "full"}:
+        selected_collection_id: Optional[int] = None
+        try:
+            if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+                selected_collection_id = int(str(selected_collection_id_raw).strip())
+        except Exception:
+            selected_collection_id = None
+
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Switch to Prvw or Full filter before adding to a local collection.",
+        )
+
+    item_id: Optional[int] = None
+    target_collection_id: Optional[int] = None
+    selected_collection_id: Optional[int] = None
+
+    try:
+        if item_id_raw and str(item_id_raw).strip():
+            item_id = int(str(item_id_raw).strip())
+    except Exception:
+        item_id = None
+
+    try:
+        if target_collection_id_raw and str(target_collection_id_raw).strip():
+            target_collection_id = int(str(target_collection_id_raw).strip())
+    except Exception:
+        target_collection_id = None
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    if not item_id:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "No item selected to add.",
+        )
+
+    if not target_collection_id:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Select a local collection first, then click + on an image or video.",
+        )
+
+    db = _get_db()
+    target_collection = db.get_collection(target_collection_id)
+
+    if not target_collection or target_collection.get("type") != "local":
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Add target must be a local collection.",
+        )
+
+    item = db.get_item_detail(item_id)
+    if not item:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Selected item was not found.",
+        )
+
+    if _active_cache_filter == "preview" and not _path_exists(item.get("preview_path")):
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "This item does not have a local preview file.",
+        )
+
+    if _active_cache_filter == "full" and not _path_exists(item.get("full_path")):
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _refresh_local_collections_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "This item does not have a local full-size file.",
+        )
+
+    existing_items = db.list_items_for_collection(target_collection_id)
+    order_index = len(existing_items)
+
+    db.add_item_to_collection(
+        collection_id=target_collection_id,
+        item_id=item_id,
+        order_index=order_index,
+    )
+
+    target_name = target_collection.get("name") or "Local Collection"
+
+    return (
+        _refresh_sidebar_payload(selected_collection_id),
+        _refresh_local_collections_payload(selected_collection_id, target_collection_id),
+        _render_feed_html(selected_collection_id),
+        f"Added reference to local collection: {target_name}",
+    )
+
+
+def _reorder_local_collection_items(reorder_payload_raw: str, selected_collection_id_raw: str):
+    selected_collection_id: Optional[int] = None
+
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    try:
+        payload = json.loads(reorder_payload_raw or "{}")
+    except Exception:
+        payload = {}
+
+    payload_collection_id = payload.get("collection_id")
+    item_ids_raw = payload.get("item_ids") or []
+
+    try:
+        payload_collection_id = int(payload_collection_id)
+    except Exception:
+        payload_collection_id = None
+
+    if not payload_collection_id:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "No reorder payload.",
+        )
+
+    if selected_collection_id != payload_collection_id:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Collection changed, reorder ignored.",
+        )
+
+    db = _get_db()
+    reordered = db.reorder_local_collection_items(payload_collection_id, item_ids_raw)
+
+    if not reordered:
+        return (
+            _refresh_sidebar_payload(selected_collection_id),
+            _render_feed_html(selected_collection_id),
+            "Reorder failed.",
+        )
+
+    return (
+        _refresh_sidebar_payload(selected_collection_id),
+        _render_feed_html(selected_collection_id),
+        "Order saved.",
+    )
 
 
 def _toggle_nsfw_filter(selected_collection_id_raw: str):
@@ -1860,13 +2787,15 @@ def _return_detail_to_scroll(selected_collection_id_raw: str, selected_item_id_r
     )
 
 
-def _set_preview_size(preview_size_raw: int, selected_collection_id_raw: str):
+def _set_preview_size(preview_step_raw: int, selected_collection_id_raw: str):
     global _preview_size
 
     try:
-        _preview_size = max(128, min(PREVIEW_SIZE_MAX, int(preview_size_raw)))
+        step_index = int(preview_step_raw)
+        step_index = max(0, min(len(PREVIEW_SIZE_STEPS) - 1, step_index))
+        _preview_size = PREVIEW_SIZE_STEPS[step_index]
     except Exception:
-        _preview_size = 128
+        _preview_size = PREVIEW_SIZE_STEPS[0]
 
     selected_collection_id: Optional[int] = None
     try:
@@ -1918,6 +2847,30 @@ def _scan_local_files_for_availability(selected_collection_id_raw: str):
         _refresh_sidebar_payload(selected_collection_id),
         _render_feed_html(selected_collection_id),
         status,
+    )
+
+
+def _set_cache_filter(filter_name: str, selected_collection_id_raw: str):
+    global _active_cache_filter
+
+    if filter_name not in {"sync", "preview", "full"}:
+        filter_name = "sync"
+
+    _active_cache_filter = filter_name
+
+    selected_collection_id: Optional[int] = None
+    try:
+        if selected_collection_id_raw and str(selected_collection_id_raw).strip():
+            selected_collection_id = int(str(selected_collection_id_raw).strip())
+    except Exception:
+        selected_collection_id = None
+
+    return (
+        gr.update(variant="primary" if _active_cache_filter == "sync" else "secondary"),
+        gr.update(variant="primary" if _active_cache_filter == "preview" else "secondary"),
+        gr.update(variant="primary" if _active_cache_filter == "full" else "secondary"),
+        _render_controls_bar(),
+        _render_feed_html(selected_collection_id),
     )
 
 
@@ -3178,10 +4131,46 @@ def on_ui_tabs():
             }}
 
             #collection_toolbar_row {{
-                background: #d7ecff !important;
+                background: #26334f !important;
                 border-radius: 10px !important;
                 padding: 6px 8px !important;
                 margin-bottom: 6px !important;
+            }}
+
+            #collection_cache_filter_sync_button,
+            #collection_cache_filter_preview_button,
+            #collection_cache_filter_full_button {{
+                min-width: 46px !important;
+                width: 46px !important;
+                height: 24px !important;
+                min-height: 24px !important;
+                padding: 0 6px !important;
+                margin-top: 6px !important;
+                font-size: 11px !important;
+                font-weight: 700 !important;
+                border-radius: 7px !important;
+            }}
+
+            #collection_preview_size_slider input[type="number"],
+            #collection_preview_size_slider .input-wrap {{
+                display: none !important;
+            }}
+
+            #collection_preview_size_ticks {{
+                display: flex !important;
+                justify-content: space-between !important;
+                padding: 0 5px !important;
+                margin-top: -6px !important;
+                pointer-events: none !important;
+            }}
+
+            #collection_preview_size_ticks span {{
+                display: block !important;
+                width: 2px !important;
+                height: 7px !important;
+                border-radius: 999px !important;
+                background: #9aa8c7 !important;
+                opacity: 0.85 !important;
             }}
 
             .collection-cards.collection-view-grid {{
@@ -3193,6 +4182,143 @@ def on_ui_tabs():
 
             .collection-card {{
                 width: 100%;
+            }}
+
+            #collection_list_container {{
+                flex: 0 0 auto !important;
+                height: 400px !important;
+                overflow: hidden !important;
+            }}
+
+            #collection_sidebar_html {{
+                flex: 0 0 auto !important;
+                height: 400px !important;
+                overflow: hidden !important;
+            }}
+            #collection_sidebar_actions {{
+                flex: 0 0 auto !important;
+                padding: 6px 10px 8px 10px !important;
+                border-top: 1px solid #252b35 !important;
+            }}
+            #collection_sidebar_actions button {{
+                min-height: 30px !important;
+                height: 30px !important;
+                padding: 3px 8px !important;
+                border-radius: 8px !important;
+                font-size: 14px !important;
+                font-weight: 700 !important;
+                margin: 0 !important;
+            }}
+
+            #collection_sync_button {{
+                font-size: 18px !important;
+            }}
+
+            #collection_refresh_button {{
+                font-size: 18px !important;
+            }}
+
+            #collection_sync_row,
+            #collection_download_row {{
+                display: flex !important;
+                flex-wrap: nowrap !important;
+                gap: 6px !important;
+                width: 100% !important;
+            }}
+
+            #collection_sync_row > div:first-child {{
+                flex: 1 1 auto !important;
+                min-width: 0 !important;
+            }}
+
+            #collection_sync_row > div:last-child {{
+                flex: 0 0 34px !important;
+                min-width: 34px !important;
+                max-width: 34px !important;
+            }}
+
+            #collection_download_row > div {{
+                flex: 1 1 0 !important;
+                min-width: 0 !important;
+            }}
+
+            #collection_sync_button,
+            #collection_preview_download_button,
+            #collection_full_download_button,
+            #collection_refresh_button {{
+                width: 100% !important;
+            }}
+
+            #collection_stop_button {{
+                min-width: 30px !important;
+                width: 30px !important;
+                padding: 0 !important;
+                font-size: 0 !important;
+                color: transparent !important;
+                position: relative !important;
+            }}
+
+            #collection_stop_button::before {{
+                content: "" !important;
+                position: absolute !important;
+                left: 50% !important;
+                top: 50% !important;
+                width: 10px !important;
+                height: 10px !important;
+                transform: translate(-50%, -50%) !important;
+                border-radius: 2px !important;
+                background: #ff3b3b !important;
+            }}
+
+            #collection_status_markdown {{
+                font-size: 11px !important;
+                color: #9aa0aa !important;
+                margin-top: 2px !important;
+                margin-bottom: 0px !important;
+                padding: 0 !important;
+            }}
+
+            #collection_maintenance_tools {{
+                margin-top: -8px !important;
+            }}
+
+            #collection_maintenance_tools > div {{
+                padding-top: 0 !important;
+                margin-top: 0 !important;
+            }}
+
+            #collection_maintenance_tools button {{
+                min-height: 28px !important;
+                height: 28px !important;
+                padding: 3px 8px !important;
+                border-radius: 8px !important;
+                font-size: 14px !important;
+                font-weight: 700 !important;
+                margin: 0 !important;
+            }}
+
+            #collection_local_collections_panel {{
+                flex: 0 0 auto !important;
+                padding: 8px 10px 10px 10px !important;
+                border-top: 1px solid #252b35 !important;
+            }}
+
+            #collection_local_collections_panel button {{
+                min-height: 28px !important;
+                height: 28px !important;
+                padding: 2px 8px !important;
+                border-radius: 8px !important;
+                font-size: 13px !important;
+                font-weight: 700 !important;
+                margin: 0 !important;
+            }}
+
+            #collection_local_name_input textarea,
+            #collection_local_name_input input {{
+                min-height: 30px !important;
+                height: 30px !important;
+                font-size: 12px !important;
+                padding: 4px 8px !important;
             }}
             </style>
             """
@@ -3222,6 +4348,36 @@ def on_ui_tabs():
             elem_id="collection_batch_offset",
         )
 
+        video_batch_offset = gr.Textbox(
+            value="0",
+            visible=False,
+            elem_id="collection_video_batch_offset",
+        )
+
+        local_delete_confirm_id = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_local_delete_confirm_id",
+        )
+
+        target_local_collection_id = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_target_local_collection_id",
+        )
+
+        local_add_item_id = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_local_add_item_id",
+        )
+
+        reorder_payload = gr.Textbox(
+            value="",
+            visible=False,
+            elem_id="collection_reorder_payload",
+        )
+
         batch_payload_html = gr.HTML(
             value="",
             visible=False,
@@ -3232,6 +4388,30 @@ def on_ui_tabs():
             "Load More Internal",
             visible=False,
             elem_id="collection_load_more_button",
+        )
+
+        video_batch_button = gr.Button(
+            "Video Batch Internal",
+            visible=False,
+            elem_id="collection_video_batch_button",
+        )
+
+        local_add_item_button = gr.Button(
+            "Local Add Internal",
+            visible=False,
+            elem_id="collection_local_add_item_button",
+        )
+
+        target_local_collection_button = gr.Button(
+            "Target Local Collection Internal",
+            visible=False,
+            elem_id="collection_target_local_collection_button",
+        )
+
+        reorder_button = gr.Button(
+            "Reorder Internal",
+            visible=False,
+            elem_id="collection_reorder_button",
         )
 
         with gr.Row(equal_height=True):
@@ -3249,22 +4429,133 @@ def on_ui_tabs():
                     """
                 )
 
-                sidebar_html = gr.HTML(
-                    value=_refresh_sidebar_payload(),
-                    elem_id="collection_sidebar_html",
-                )
+                with gr.Column(elem_id="collection_list_container"):
+                    sidebar_html = gr.HTML(
+                        value=_refresh_sidebar_payload(),
+                        elem_id="collection_sidebar_html",
+                    )
 
-                with gr.Row():
-                    sync_button = gr.Button("Sync collections", variant="primary")
-                    preview_download_button = gr.Button("Preview Download")
-                    full_download_button = gr.Button("Full Download")
-                    stop_button = gr.Button("Stop", variant="stop")
-                    refresh_button = gr.Button("Refresh")
-                    clear_cache_button = gr.Button("Clear Cache")
-                    scan_local_files_button = gr.Button("Scan Local Files")
-                    reset_button = gr.Button("Reset", variant="stop")
+                with gr.Column(elem_id="collection_sidebar_actions"):
+                    gr.HTML(
+                        """
+                        <div style="
+                            color:#9aa0aa;
+                            font-size:11px;
+                            font-weight:700;
+                            letter-spacing:0.08em;
+                            text-transform:uppercase;
+                            margin-bottom:6px;
+                        ">
+                            Actions
+                        </div>
+                        """
+                    )
 
-                status_markdown = gr.Markdown("")
+                    with gr.Row(equal_height=True, elem_id="collection_sync_row"):
+                        with gr.Column(scale=1, min_width=0):
+                            sync_button = gr.Button(
+                                "Sync",
+                                variant="primary",
+                                elem_id="collection_sync_button",
+                            )
+
+                        with gr.Column(scale=0, min_width=34):
+                            stop_button = gr.Button(
+                                "Stop",
+                                variant="stop",
+                                elem_id="collection_stop_button",
+                            )
+
+                    with gr.Row(equal_height=True, elem_id="collection_download_row"):
+                        with gr.Column(scale=1, min_width=0):
+                            preview_download_button = gr.Button(
+                                "Prvw Download",
+                                elem_id="collection_preview_download_button",
+                            )
+
+                        with gr.Column(scale=1, min_width=0):
+                            full_download_button = gr.Button(
+                                "Full Download",
+                                elem_id="collection_full_download_button",
+                            )
+
+                    refresh_button = gr.Button(
+                        "Refresh",
+                        elem_id="collection_refresh_button",
+                    )
+
+                    status_markdown = gr.Markdown(
+                        "",
+                        elem_id="collection_status_markdown",
+                    )
+
+                    with gr.Accordion(
+                        "Maintenance",
+                        open=False,
+                        elem_id="collection_maintenance_tools",
+                    ):
+                        scan_local_files_button = gr.Button("Scan Local Files")
+                        clear_cache_button = gr.Button("Clear Cache")
+                        reset_button = gr.Button("Reset", variant="stop")
+
+                with gr.Column(elem_id="collection_local_collections_panel"):
+                    gr.HTML(
+                        """
+                        <div style="
+                            color:#9aa0aa;
+                            font-size:11px;
+                            font-weight:700;
+                            letter-spacing:0.08em;
+                            text-transform:uppercase;
+                            margin-bottom:6px;
+                        ">
+                            Local Collections
+                        </div>
+                        """
+                    )
+
+                    local_collection_name = gr.Textbox(
+                        value="",
+                        placeholder="New Collection",
+                        show_label=False,
+                        elem_id="collection_local_name_input",
+                    )
+
+                    with gr.Row(equal_height=True):
+                        local_create_button = gr.Button(
+                            "+",
+                            elem_id="collection_local_create_button",
+                            tooltip="Create a new local collection",
+                        )
+                        local_delete_button = gr.Button(
+                            "−",
+                            variant="stop",
+                            elem_id="collection_local_delete_button",
+                            tooltip="Delete selected local collection",
+                        )
+                        local_rename_button = gr.Button(
+                            "Rename",
+                            elem_id="collection_local_rename_button",
+                            tooltip="Rename selected local collection",
+                        )
+
+                    local_collections_html = gr.HTML(
+                        value=_refresh_local_collections_payload(),
+                        elem_id="collection_local_collections_html",
+                    )
+
+                    gr.HTML(
+                        """
+                        <div style="
+                            color:#6f7682;
+                            font-size:11px;
+                            line-height:1.35;
+                            margin-top:6px;
+                        ">
+                            Local collections are reference-only. They do not copy or delete physical files.
+                        </div>
+                        """
+                    )
 
             with gr.Column(scale=3):
                 with gr.Row(equal_height=False, elem_id="collection_toolbar_row"):
@@ -3279,19 +4570,56 @@ def on_ui_tabs():
                                 background-image:url('{THUMB_SCALE_ICON_DATA_URI}');
                                 background-repeat:no-repeat;
                                 background-position:center;
-                                background-size:20px 20px;
+                                background-size:28px 28px;
                             "></div>
                             """
                         )
 
-                    with gr.Column(scale=1, min_width=180):
+                    with gr.Column(scale=1, min_width=90):
                         preview_size_slider = gr.Slider(
-                            minimum=128,
-                            maximum=PREVIEW_SIZE_MAX,
-                            step=16,
-                            value=_preview_size,
+                            minimum=0,
+                            maximum=len(PREVIEW_SIZE_STEPS) - 1,
+                            step=1,
+                            value=PREVIEW_SIZE_STEPS.index(_preview_size),
                             show_label=False,
                             elem_id="collection_preview_size_slider",
+                        )
+                        gr.HTML(
+                            """
+                            <div id="collection_preview_size_ticks">
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                                <span></span>
+                            </div>
+                            """
+                        )
+
+                    with gr.Column(scale=0, min_width=50):
+                        cache_filter_sync_button = gr.Button(
+                            value="Sync",
+                            elem_id="collection_cache_filter_sync_button",
+                            tooltip="Show all synced items",
+                            variant="primary",
+                        )
+
+                    with gr.Column(scale=0, min_width=50):
+                        cache_filter_preview_button = gr.Button(
+                            value="Prvw",
+                            elem_id="collection_cache_filter_preview_button",
+                            tooltip="Show items with preview files",
+                            variant="secondary",
+                        )
+
+                    with gr.Column(scale=0, min_width=50):
+                        cache_filter_full_button = gr.Button(
+                            value="Full",
+                            elem_id="collection_cache_filter_full_button",
+                            tooltip="Show items with full downloads",
+                            variant="secondary",
                         )
 
                     with gr.Column(scale=0, min_width=36):
@@ -3374,6 +4702,89 @@ def on_ui_tabs():
             outputs=[controls_html, sidebar_html, feed_html],
         )
 
+        local_create_button.click(
+            fn=_create_local_collection,
+            inputs=[local_collection_name],
+            outputs=[
+                selected_collection_id,
+                target_local_collection_id,
+                sidebar_html,
+                feed_html,
+                local_collection_name,
+                local_collections_html,
+                status_markdown,
+            ],
+        )
+
+        local_rename_button.click(
+            fn=_rename_selected_local_collection,
+            inputs=[selected_collection_id, local_collection_name],
+            outputs=[
+                sidebar_html,
+                local_collection_name,
+                local_collections_html,
+                status_markdown,
+            ],
+        )
+
+        local_delete_button.click(
+            fn=_delete_selected_local_collection,
+            inputs=[selected_collection_id, local_delete_confirm_id],
+            outputs=[
+                selected_collection_id,
+                local_delete_confirm_id,
+                sidebar_html,
+                feed_html,
+                local_collection_name,
+                local_collections_html,
+                status_markdown,
+            ],
+        )
+
+        local_add_item_button.click(
+            fn=_add_item_to_target_local_collection,
+            inputs=[
+                local_add_item_id,
+                target_local_collection_id,
+                selected_collection_id,
+            ],
+            outputs=[
+                sidebar_html,
+                local_collections_html,
+                feed_html,
+                status_markdown,
+            ],
+        )
+
+        target_local_collection_button.click(
+            fn=_set_target_local_collection,
+            inputs=[
+                target_local_collection_id,
+                selected_collection_id,
+            ],
+            outputs=[
+                selected_collection_id,
+                sidebar_html,
+                feed_html,
+                local_collection_name,
+                local_collections_html,
+                status_markdown,
+            ],
+        )
+
+        reorder_button.click(
+            fn=_reorder_local_collection_items,
+            inputs=[
+                reorder_payload,
+                selected_collection_id,
+            ],
+            outputs=[
+                sidebar_html,
+                feed_html,
+                status_markdown,
+            ],
+        )
+
         nsfw_toggle_button.click(
             fn=_toggle_nsfw_filter,
             inputs=[selected_collection_id],
@@ -3449,6 +4860,51 @@ def on_ui_tabs():
             outputs=[video_button, controls_html, feed_html],
         )
 
+        cache_filter_sync_button.click(
+            fn=lambda selected_collection_id_raw: _set_cache_filter(
+                "sync",
+                selected_collection_id_raw,
+            ),
+            inputs=[selected_collection_id],
+            outputs=[
+                cache_filter_sync_button,
+                cache_filter_preview_button,
+                cache_filter_full_button,
+                controls_html,
+                feed_html,
+            ],
+        )
+
+        cache_filter_preview_button.click(
+            fn=lambda selected_collection_id_raw: _set_cache_filter(
+                "preview",
+                selected_collection_id_raw,
+            ),
+            inputs=[selected_collection_id],
+            outputs=[
+                cache_filter_sync_button,
+                cache_filter_preview_button,
+                cache_filter_full_button,
+                controls_html,
+                feed_html,
+            ],
+        )
+
+        cache_filter_full_button.click(
+            fn=lambda selected_collection_id_raw: _set_cache_filter(
+                "full",
+                selected_collection_id_raw,
+            ),
+            inputs=[selected_collection_id],
+            outputs=[
+                cache_filter_sync_button,
+                cache_filter_preview_button,
+                cache_filter_full_button,
+                controls_html,
+                feed_html,
+            ],
+        )
+
         clear_cache_button.click(
             fn=_clear_cache,
             inputs=[],
@@ -3470,7 +4926,16 @@ def on_ui_tabs():
         selected_collection_id.change(
             fn=_load_collection_feed,
             inputs=[selected_collection_id],
-            outputs=[sidebar_html, feed_html],
+            outputs=[
+                sidebar_html,
+                feed_html,
+                local_collection_name,
+                local_collections_html,
+            ],
+        ).then(
+            fn=lambda: gr.update(value=""),
+            inputs=[],
+            outputs=[local_delete_confirm_id],
         )
 
         selected_item_id.change(
@@ -3507,6 +4972,12 @@ def on_ui_tabs():
             fn=_load_more_feed_batch,
             inputs=[selected_collection_id, batch_offset],
             outputs=[batch_payload_html],
+        )
+
+        video_batch_button.click(
+            fn=_set_video_batch,
+            inputs=[selected_collection_id, video_batch_offset],
+            outputs=[feed_html],
         )
 
     return [(collection_tab, "Collection", "collection_tab")]
