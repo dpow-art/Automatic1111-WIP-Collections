@@ -106,7 +106,6 @@ We are building a **3-mode browsing system**:
   - Generation settings
   - Resources used
 
-**Future:**
 - 🟢 / 🔴 indicators for local resource availability
 
 ---
@@ -162,19 +161,19 @@ Collection sidebar
 Feed rendering
 NSFW filter system
 Button architecture established
-🔄 Phase 2 — View System Core (CURRENT)
+✅ Phase 2 — View System Core (CURRENT)
 View switching logic
 Layout containers
 Toolbar system
 State handling between views
-⏳ Phase 3 — View Implementation
+✅ Phase 3 — View Implementation
 Regular view polish
 Scrolling view build
 Detailed view layout + binding
-⏳ Phase 4 — Navigation
+✅ Phase 4 — Navigation
 Left / right image navigation
 State persistence
-⏳ Phase 5 — Resource Matching
+✅ Phase 5 — Resource Matching
 🟢 Available locally
 🔴 Missing resources
 Applies to:
@@ -226,15 +225,7 @@ UI: Transitioning to multi-view system
 Buttons: Standardized and ready for expansion
 
 
-🔜 Next Immediate Task
 
-Build view switching system + layout scaffolding
-
-This includes:
-
-Toolbar buttons (grid / scroll / detailed)
-View state management
-Container switching logic
 📌 Final Note
 
 This project is designed to:
